@@ -1,0 +1,5270 @@
+---
+title: "Análisis predictivo de ictus mediante aprendizaje automático"
+author: "Alejandro Baratas Álvarez"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+
+
+# 1. Configuración inicial.
+En esta sección se establecen las opciones globales del documento, se cargan las librerías necesarias y se importa el conjunto de datos original. El objetivo es garantizar la reproducibilidad y correcta ejecución de los análisis. 
+
+## 1.1. Setup del archivo.
+
+```{r setup, include=FALSE}
+# Ajustar directorio de trabajo al del .Rmd
+if (interactive()) {
+  setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+}
+
+# Ajuste general del archivo
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = 'center',
+  fig.width = 8,
+  fig.height = 5,
+  cache = FALSE,
+  cache.lazy = FALSE,
+  autodep = TRUE
+)
+
+# Semilla global
+set.seed(123)
+
+options(yardstick.event_first = FALSE)
+
+# Progreso visible durante el knit
+options(progressr.enable = TRUE)
+```
+
+
+## 1.2. Carga de librerías
+
+
+```{r librerias, echo=TRUE, warning=FALSE, message=FALSE}
+
+# MANIPULACIÓN DE DATOS
+library(tidyverse)      # Incluye dplyr, tidyr, ggplot2, etc.
+library(reshape2)        # Reestructuración de datos
+
+# VISUALIZACIÓN
+library(rpart.plot)
+library(patchwork)
+
+# MACHINE LEARNING
+library(tidymodels)      # Framework de ML (incluye recipes, parsnip)
+library(ranger)          # Random Forest rápido
+library(themis)          # Balanceo de clases
+library(probably)        # Evaluación de modelos
+
+# COMPUTACIÓN 
+library(future)          # Paralelización
+library(progressr)       # Barras de progreso
+
+# TABLAS Y REPORTES
+library(kableExtra)      # Tablas en RMarkdown
+library(DT)              # Tablas interactivas
+library(grid)
+library(gridExtra)       # Composición de tablas/gráficos    
+```
+
+
+## 1.3. Importación del dataset stroke.csv
+
+```{r carga_csv}
+
+stroke_raw <- readr::read_csv(
+  "data/stroke.csv",
+  na = c("", "NA", "N/A"),
+  show_col_types = FALSE
+)
+
+
+```
+
+
+# 2. Caracterización inicial del dataset.
+
+
+## 2.1. Visualización interactiva del dataset original.
+
+Con el fin de realizar una inspección preliminar al dataset *strokec.csv* se genera una tabla interactiva que permite explorar las observaciones de forma dinámica. Es una forma rápida de conocer las variables y poder identificar posibles anomalías. Se crea el objeto **stroke_raw** que contiene los datos en su estado original. 
+
+```{r exploracion_visual_dataset}
+DT::datatable(
+  stroke_raw,
+  options = list(
+    pageLength = 10,
+    scrollX = TRUE,
+    autoWidth = TRUE
+  ),
+  rownames = FALSE,
+  caption = htmltools::tags$caption(
+    style = 'caption-side: top; text-align: center;',
+    "Vista interactiva del dataset completo"
+  )
+)
+```
+
+
+
+## 2.2. Métricas globales y estructura del dataset.
+
+En esta sección se lleva a cabo un análisis descriptivo inicial del conjunto de datos original con el objetivo de comprender su estructura y evaluar su calidad.
+
+En primer lugar, se determina el número de observaciones y variables, así como la cantidad de valores perdidos. A continuación, se clasifican las variables según su tipo (numéricas, categóricas u otras) y se identifican aquellas de naturaleza binaria.
+
+El resultado se almacena en el objeto **df_metricas** que resume la estructura básica del dataset. 
+
+```{r metricas_globales_dataset}
+
+# Clasificación de variables
+tipo_vars <- purrr::map_chr(stroke_raw, function(x) {
+  clase <- class(x)
+  
+  if (any(clase %in% c("numeric", "integer", "integer64"))) {
+    "Numérica"
+  } else if (any(clase %in% c("character", "factor"))) {
+    "Categórica"
+  } else {
+    "Otro"
+  }
+})
+
+# Métricas del dataset
+metricas <- c(
+  "Número de observaciones",
+  "Número de variables",
+  "Valores perdidos (NA)",
+  "Variables numéricas",
+  "Variables categóricas",
+  "Variables de otro tipo"
+)
+
+valores <- c(
+  nrow(stroke_raw),
+  ncol(stroke_raw),
+  sum(is.na(stroke_raw)),
+  sum(tipo_vars == "Numérica"),
+  sum(tipo_vars == "Categórica"),
+  sum(tipo_vars == "Otro")
+)
+
+# Crear data frame
+tabla_df <- data.frame(
+  "Métrica" = metricas,
+  "Valor" = valores
+)
+
+
+# Crear tabla
+tabla_grob <- tableGrob(
+  tabla_df,
+  rows = NULL,
+  theme = ttheme_minimal(
+    
+    core = list(
+      fg_params = list(
+        cex = 1, 
+        fontfamily = "Times New Roman"   # ← fuente
+      ),
+      bg_params = list(fill = "white", col = "black", lwd = 1)
+    ),
+    
+    colhead = list(
+      fg_params = list(
+        col = "white", 
+        fontface = "bold",
+        cex = 1,
+        fontfamily = "Times New Roman"   # ← fuente cabecera
+      ),
+      bg_params = list(fill = "#2c3e50", col = "black", lwd = 1)
+    )
+    
+  )
+)
+
+tabla_grob$widths <- unit(c(8, 3), "cm")
+
+# Mostrar la tabla en el .rmd
+grid.newpage()
+grid.draw(tabla_grob)
+
+
+# Guardar tabla
+png("tabla_metricas_globales.png", width = 2000, height = 1050, res = 150)
+grid.draw(tabla_grob)
+dev.off()
+
+
+```
+
+## 2.3. Clasificación de variables por tipo.
+
+En este apartado se genera un listado de las variables del dataset junto con su clase, distinguiendo entre variables numéricas, categóricas y binarias. Este análisis se almacena en el objeto **tipos_variables**, que servirá como punto de partida para las posteriores transformaciones, recodificaciones y análisis descriptivos.
+
+```{r tipos_variables_dataset, echo=FALSE}
+# Crear data frame con tipos de variables
+tipos_variables <- data.frame(
+  Variable = names(stroke_raw),
+  Tipo = sapply(stroke_raw, function(x) class(x)[1]),
+  Es_binaria = sapply(stroke_raw, function(x) {
+    is.numeric(x) && length(unique(na.omit(x))) == 2
+  }),
+  stringsAsFactors = FALSE
+)
+
+# Convertir TRUE/FALSE a Sí/No para mejor presentación
+tipos_variables$Es_binaria <- ifelse(tipos_variables$Es_binaria, "Sí", "No")
+
+# Crear tabla
+tabla_grob <- tableGrob(
+  tipos_variables,
+  rows = NULL,
+  theme = ttheme_minimal(
+    core = list(
+      fg_params = list(
+        cex = 1,
+        fontfamily = "Times New Roman"
+      ),
+      bg_params = list(fill = "white", col = "black", lwd = 1)
+    ),
+    colhead = list(
+      fg_params = list(
+        col = "white",
+        fontface = "bold",
+        cex = 1,
+        fontfamily = "Times New Roman"
+      ),
+      bg_params = list(fill = "#2c3e50", col = "black", lwd = 1)
+    )
+  )
+)
+
+# Ajustar anchos de columnas
+tabla_grob$widths <- unit(c(6, 4, 3), "cm")
+
+# Mostrar tabla en el .rmd
+grid.newpage()
+grid.draw(tabla_grob)
+
+# Guardar tabla
+png("tabla_tipos_variables.png", width = 2200, height = 1400, res = 150)
+grid.draw(tabla_grob)
+dev.off()
+```
+
+## 2.4. Distribución de variables categóricas (original).
+
+En esta sección se seleccionan las variables categóricas (incluyendo aquellas variables numéricas que actúan como binarias) y se construye un resumen detallado que incluye, para cada una de ellas, las categorías presentes, así como su frecuencia absoluta y su porcentaje relativo. El objeto **resumen_categoricas** recoge esta información, lo que permite identificar categorías con baja representación, posibles valores no registrados y otras inconsistencias que deban corregirse en fases posteriores del análisis.
+
+```{r distribucion_categoricas_original}
+
+# Selección de variables categóricas (character o factor + binarias)
+vars_categoricas <- names(stroke_raw)[
+  purrr::map_lgl(stroke_raw, ~{
+    clase <- class(.x)
+    
+    es_cat <- any(clase %in% c("character", "factor"))
+    es_binaria <- is.numeric(.x) && length(unique(na.omit(.x))) == 2
+    
+    es_cat || es_binaria
+  })
+]
+
+# Excluir identificador 
+vars_categoricas <- setdiff(vars_categoricas, "id")
+
+# Resumen de frecuencias de variables categóricas
+resumen_categoricas <- purrr::map_dfr(vars_categoricas, function(var) {
+  x <- stroke_raw[[var]]
+  
+  es_binaria <- is.numeric(x) && length(unique(na.omit(x))) == 2
+  
+  tibble::tibble(
+    Categoria = dplyr::case_when(
+      is.na(x) ~ "No registrado",
+      es_binaria & x == 0 ~ "No",
+      es_binaria & x == 1 ~ "Yes",
+      TRUE ~ as.character(x)
+    )
+  ) %>%
+    dplyr::count(Categoria, name = "N") %>%
+    dplyr::mutate(
+      Variable = var,
+      `%` = round(N / sum(N) * 100, 2)
+    ) %>%
+    dplyr::arrange(dplyr::desc(N)) %>%
+    dplyr::select(Variable, Categoria, N, `%`)
+})
+
+# Tabla final
+resumen_categoricas %>%
+  knitr::kable(
+    format = "html",
+    align = "c",
+    escape = FALSE,
+    row.names = FALSE,
+    col.names = c("Variable", "Categoría", "Frecuencia", "%"),
+    caption = "Distribución de frecuencias de variables categóricas"
+  ) %>%
+  kableExtra::kable_styling(
+    bootstrap_options = c("striped", "hover", "bordered"),
+    full_width = FALSE,
+    position = "center",
+    font_size = 12
+  ) %>%
+  kableExtra::row_spec(
+    0,
+    bold = TRUE,
+    color = "white",
+    background = "#2c3e50"
+  ) %>%
+  kableExtra::column_spec(1, bold = TRUE, width = "3.5cm") %>%
+  kableExtra::column_spec(2, width = "4cm")
+```
+
+
+## 2.5. Recodificación de variables categóricas al castellano.
+
+Con el fin de mejorar la interpretabilidad y homogeneidad del análisis se recodifican las variables al castellano mantieniendo su significado original. Para ello, se crea el diccionario **diccionario_vars** que recoge la tradución de las variables, además el objeto **freq_cat_esp** almacena las frecuencias resultantes tras la recodificación. 
+
+```{r recodificacion_categoricas_espanol}
+diccionario_vars <- c(
+  # Categóricas
+  "gender" = "Género",
+  "ever_married" = "Estado civil",
+  "work_type" = "Tipo trabajo",
+  "Residence_type" = "Tipo residencia",
+  "smoking_status" = "Estado tabaquismo",
+  "stroke" = "Ictus",
+  
+  # Numéricas
+  "age" = "Edad",
+  "avg_glucose_level" = "Niveles medios de glucosa",
+  "bmi" = "IMC",
+  
+  # Binarias
+  "hypertension" = "Hipertensión",
+  "heart_disease" = "Enfermedad cardiaca"
+)
+
+# Selección de variables categóricas + binarias numéricas
+vars_cat <- names(stroke_raw)[
+  purrr::map_lgl(stroke_raw, ~{
+    clase <- class(.x)
+    es_cat <- any(clase %in% c("character", "factor"))
+    es_binaria <- is.numeric(.x) && length(unique(stats::na.omit(.x))) == 2
+    es_cat || es_binaria
+  })
+]
+
+vars_cat <- setdiff(vars_cat, "id")
+
+# Orden deseado: primero categóricas, luego binarias
+orden_variables <- c(
+  "Género",
+  "Estado civil",
+  "Tipo trabajo",
+  "Tipo residencia",
+  "Estado tabaquismo",
+  "Ictus",
+  "Hipertensión",
+  "Enfermedad cardiaca"
+)
+
+freq_cat_esp <- stroke_raw %>%
+  dplyr::select(dplyr::all_of(vars_cat)) %>%
+  dplyr::rename_with(~ ifelse(. %in% names(diccionario_vars), diccionario_vars[.], .)) %>%
+  dplyr::mutate(dplyr::across(dplyr::everything(), as.character)) %>%
+  tidyr::pivot_longer(
+    cols = dplyr::everything(),
+    names_to = "Variable",
+    values_to = "Valor"
+  ) %>%
+  dplyr::mutate(
+    Categoria = dplyr::case_when(
+      Variable == "Género" & Valor == "Male" ~ "Hombre",
+      Variable == "Género" & Valor == "Female" ~ "Mujer",
+      Variable == "Género" & Valor == "Other" ~ "Otro",
+
+      Variable == "Estado civil" & Valor == "Yes" ~ "Casado",
+      Variable == "Estado civil" & Valor == "No" ~ "Soltero",
+
+      Variable == "Tipo trabajo" & Valor == "Private" ~ "Privado",
+      Variable == "Tipo trabajo" & Valor == "Self-employed" ~ "Autónomo",
+      Variable == "Tipo trabajo" & Valor == "Govt_job" ~ "Público",
+      Variable == "Tipo trabajo" & Valor == "children" ~ "Niños",
+      Variable == "Tipo trabajo" & Valor == "Never_worked" ~ "Nunca trabajó",
+
+      Variable == "Tipo residencia" & Valor == "Urban" ~ "Urbana",
+      Variable == "Tipo residencia" & Valor == "Rural" ~ "Rural",
+
+      Variable == "Estado tabaquismo" & Valor == "never smoked" ~ "Nunca fumó",
+      Variable == "Estado tabaquismo" & Valor == "formerly smoked" ~ "Exfumador",
+      Variable == "Estado tabaquismo" & Valor == "smokes" ~ "Fumador",
+      Variable == "Estado tabaquismo" & Valor == "Unknown" ~ "Desconocido",
+
+      Variable == "Ictus" & Valor == "0" ~ "No",
+      Variable == "Ictus" & Valor == "1" ~ "Sí",
+
+      Variable == "Hipertensión" & Valor == "0" ~ "No",
+      Variable == "Hipertensión" & Valor == "1" ~ "Sí",
+
+      Variable == "Enfermedad cardiaca" & Valor == "0" ~ "No",
+      Variable == "Enfermedad cardiaca" & Valor == "1" ~ "Sí",
+
+      Valor == "NA" ~ "No registrado",
+      TRUE ~ Valor
+    ),
+    Variable = factor(Variable, levels = orden_variables)
+  ) %>%
+  dplyr::count(Variable, Categoria, name = "N") %>%
+  dplyr::group_by(Variable) %>%
+  dplyr::mutate(
+    Porcentaje = round(100 * N / sum(N), 2),
+    `%` = paste0(Porcentaje, "%"),
+    orden = ifelse(Categoria == "No registrado", 0, 1)
+  ) %>%
+  dplyr::ungroup() %>%
+  dplyr::arrange(Variable, orden, dplyr::desc(N)) %>%
+  dplyr::mutate(Variable = as.character(Variable)) %>%
+  dplyr::select(Variable, Categoria, N, `%`)
+
+tabla_df <- freq_cat_esp %>%
+  mutate(
+    Variable_mostrar = ifelse(duplicated(Variable), "", Variable)
+  ) %>%
+  select(
+    Variable = Variable_mostrar,
+    Categoría = Categoria,
+    N,
+    `%`
+  )
+
+# Crear tabla gráfica
+# Crear tabla gráfica
+tabla_df <- freq_cat_esp %>%
+  dplyr::select(
+    Variable,
+    Categoría = Categoria,
+    N,
+    `%`
+  )
+
+# Crear tabla base
+tabla_grob <- tableGrob(
+  tabla_df,
+  rows = NULL,
+  theme = ttheme_minimal(
+    core = list(
+      fg_params = list(
+        cex = 0.9,
+        fontfamily = "Times New Roman"
+      ),
+      bg_params = list(
+        fill = "white",
+        col = "black",   # cuadrícula negra
+        lwd = 0.8
+      )
+    ),
+    colhead = list(
+      fg_params = list(
+        col = "white",
+        fontface = "bold",
+        cex = 1,
+        fontfamily = "Times New Roman"
+      ),
+      bg_params = list(
+        fill = "#2c3e50",
+        col = "black",   # cuadrícula negra también en cabecera
+        lwd = 0.8
+      )
+    )
+  )
+)
+
+# Anchos de columna
+tabla_grob$widths <- unit(c(5.5, 3.5, 2, 2), "cm")
+
+# -------------------------------
+# Fusión visual de la primera columna
+# -------------------------------
+vars <- tabla_df$Variable
+rle_vars <- rle(vars)
+
+starts <- cumsum(c(1, head(rle_vars$lengths, -1)))
+ends   <- cumsum(rle_vars$lengths)
+
+# 1) Vaciar texto y fondo/borde de las celdas originales de la primera columna
+for (r in seq_len(nrow(tabla_df))) {
+  
+  # Texto de la primera columna
+  idx_fg <- which(
+    tabla_grob$layout$t == (r + 1) &
+      tabla_grob$layout$l == 1 &
+      grepl("core-fg", tabla_grob$layout$name)
+  )
+  
+  if (length(idx_fg) == 1) {
+    tabla_grob$grobs[[idx_fg]]$label <- ""
+  }
+  
+  # Fondo/borde de la primera columna
+  idx_bg <- which(
+    tabla_grob$layout$t == (r + 1) &
+      tabla_grob$layout$l == 1 &
+      grepl("core-bg", tabla_grob$layout$name)
+  )
+  
+  if (length(idx_bg) == 1) {
+    tabla_grob$grobs[[idx_bg]]$gp <- gpar(
+      fill = "white",
+      col = NA   # quitamos bordes internos originales
+    )
+  }
+}
+
+# 2) Dibujar una celda grande por cada bloque de variable
+for (i in seq_along(starts)) {
+  s <- starts[i]
+  e <- ends[i]
+  val <- rle_vars$values[i]
+  
+  # Añadir rectángulo que ocupa varias filas en la primera columna
+  tabla_grob <- gtable::gtable_add_grob(
+    tabla_grob,
+    grobs = rectGrob(
+      gp = gpar(fill = "white", col = "black", lwd = 0.8)
+    ),
+    t = s + 1,   # +1 por la cabecera
+    b = e + 1,
+    l = 1,
+    r = 1,
+    z = Inf,
+    name = paste0("merged_rect_", i)
+  )
+  
+  # Añadir texto centrado en esa celda fusionada
+  tabla_grob <- gtable::gtable_add_grob(
+    tabla_grob,
+    grobs = textGrob(
+      label = val,
+      x = 0.5, y = 0.5,
+      just = "centre",
+      gp = gpar(
+        fontfamily = "Times New Roman",
+        fontsize = 12,
+        fontface = "bold"
+      )
+    ),
+    t = s + 1,
+    b = e + 1,
+    l = 1,
+    r = 1,
+    z = Inf + 1,
+    name = paste0("merged_text_", i)
+  )
+}
+
+# Mostrar en el Rmd
+grid.newpage()
+grid.draw(tabla_grob)
+
+# Guardar PNG
+png("tabla_distribucion_categoricas_recodificadas.png",
+    width = 2800, height = 3200, res = 200, bg = "white")
+grid.newpage()
+grid.draw(tabla_grob)
+dev.off()
+```
+
+
+
+## 2.6. Estadísticos descriptivos de variables numéricas continuas.
+
+En esta sección se genera el objeto **resumen_numericas** que recoge el análisis descriptivo de las variables numéricas continúas. En este análisis se incluyen estadísticos como la media, mediana, cuartiles, desviación estándar y rango intercuartílico y la proporición de valores perdidos. Este resumen es fundamental para detectar posibles valores atípicos, evaluar la necesidad de transformaciones y comprender el comportamiento de cada variable antes de su inclusión en los modelos predictivos.
+
+```{r estadisticos_numericas_continuas, echo=TRUE, warning=FALSE, message=FALSE}
+
+# Selección de variables numéricas continuas (excluyendo binarias 0/1)
+vars_numericas_continuas <- names(stroke_raw)[
+  purrr::map_lgl(stroke_raw, ~{
+    clase <- class(.x)
+    es_numerica <- any(clase %in% c("numeric", "integer", "integer64"))
+    valores <- unique(stats::na.omit(.x))
+    es_binaria_01 <- es_numerica &&
+      length(valores) > 0 &&
+      all(valores %in% c(0, 1))
+    es_numerica && !es_binaria_01
+  })
+]
+
+# Excluir identificador si existe
+vars_numericas_continuas <- setdiff(vars_numericas_continuas, "id")
+
+# Resumen de variables continuas
+resumen_numericas <- purrr::map_dfr(vars_numericas_continuas, function(var) {
+  x <- stroke_raw[[var]]
+  nombre_var <- ifelse(var %in% names(diccionario_vars), diccionario_vars[var], var)
+  
+  if (all(is.na(x))) {
+    tibble::tibble(
+      Variable = nombre_var,
+      n = length(x),
+      NAs = sum(is.na(x)),
+      `% NAs` = round(mean(is.na(x)) * 100, 2),
+      Mín = NA_real_,
+      Q1 = NA_real_,
+      Mediana = NA_real_,
+      Media = NA_real_,
+      Q3 = NA_real_,
+      Máx = NA_real_,
+      `D. E.` = NA_real_,
+      IQR = NA_real_
+    )
+  } else {
+    tibble::tibble(
+      Variable = nombre_var,
+      n = length(x),
+      NAs = sum(is.na(x)),
+      `% NAs` = round(mean(is.na(x)) * 100, 2),
+      Mín = round(min(x, na.rm = TRUE), 2),
+      Q1 = round(as.numeric(stats::quantile(x, 0.25, na.rm = TRUE)), 2),
+      Mediana = round(stats::median(x, na.rm = TRUE), 2),
+      Media = round(mean(x, na.rm = TRUE), 2),
+      Q3 = round(as.numeric(stats::quantile(x, 0.75, na.rm = TRUE)), 2),
+      Máx = round(max(x, na.rm = TRUE), 2),
+      `D. E.` = round(stats::sd(x, na.rm = TRUE), 2),
+      IQR = round(stats::IQR(x, na.rm = TRUE), 2)
+    )
+  }
+})
+
+# Tabla final
+tabla_df <- resumen_numericas %>%
+  dplyr::select(
+    Variable, n, NAs, `% NAs`,
+    Mín, Q1, Mediana, Media, Q3, Máx, `D. E.`, IQR
+  )
+
+# Crear tabla
+tabla_grob <- tableGrob(
+  tabla_df,
+  rows = NULL,
+  theme = ttheme_minimal(
+    core = list(
+      fg_params = list(
+        cex = 0.8,
+        fontfamily = "Times New Roman"
+      ),
+      bg_params = list(
+        fill = "white",
+        col = "black",
+        lwd = 0.5
+      )
+    ),
+    colhead = list(
+      fg_params = list(
+        col = "white",
+        fontface = "bold",
+        cex = 0.85,
+        fontfamily = "Times New Roman"
+      ),
+      bg_params = list(
+        fill = "#2c3e50",
+        col = "black",
+        lwd = 0.5
+      )
+    )
+  )
+)
+
+for (i in seq_len(nrow(tabla_df))) {
+  idx <- which(
+    tabla_grob$layout$t == (i + 1) &
+    tabla_grob$layout$l == 1 &
+    grepl("core-fg", tabla_grob$layout$name)
+  )
+  
+  if (length(idx) == 1) {
+    tabla_grob$grobs[[idx]]$gp <- gpar(
+      fontface = "bold",
+      fontfamily = "Times New Roman",
+      fontsize = 10
+    )
+  }
+}
+
+# Ajustar ancho de columnas
+tabla_grob$widths <- unit(c(4.8, 1.3, 1.3, 1.5, 1.3, 1.3, 1.9, 1.5, 1.3, 1.3, 1.5, 1.3), "cm")
+
+# Mostrar en el .Rmd
+grid.newpage()
+grid.draw(tabla_grob)
+
+# Guardar como PNG
+png("tabla_resumen_numericas.png", width = 3200, height = 900, res = 200, bg = "white")
+grid.newpage()
+grid.draw(tabla_grob)
+dev.off()
+```
+
+
+
+
+# 3. Preprocesamiento y construcción del dataset
+
+
+## 3.1 Construcción del dataset base (stroke_base).
+  
+En este apartado se construye el dataset base que servirá como punto de partida para el análisis y el modelado. A partir del objeto **stroke_raw**, generado anteriormente, se aplican 4 transformaciones cuyo resultado se almacenará en el objeto **stroke_base**. Las transformaciones realizadas son:
+
+  1) Eliminación de la categoría ***Other*** en la variable género por su escasa representatividad. 
+  2) Recodificación de todas las variables al castellano para facilitar su interpretación.
+  3) Creación de la variable **Grupos edad** a partari de la variable continua "Edad".
+  4) Conversión de las variables binarias a categóricas con niveles "No/Sí". 
+
+```{r crear_stroke_base, echo=TRUE, warning=FALSE, message=FALSE}
+
+stroke_base <- stroke_raw %>%
+  dplyr::filter(gender != "Other", as.numeric(age) >= 16) %>%
+  dplyr::transmute(
+    # Variables demográficas
+    Género = as.factor(dplyr::recode(
+      gender,
+      "Male" = "Hombre",
+      "Female" = "Mujer",
+      .default = NA_character_
+    )),
+
+    Edad = as.numeric(age),
+
+    # Grupos de edad
+    `Grupos edad` = dplyr::case_when(
+      Edad <= 34 ~ "16-34",
+      Edad <= 55 ~ "35-55",
+      Edad <= 69 ~ "56-69",
+      TRUE ~ "70+"
+    ) %>% factor(levels = c("16-34", "35-55", "56-69", "70+")),
+
+    # Variable objetivo
+    Ictus = as.factor(dplyr::recode(
+      as.character(stroke),
+      "0" = "No",
+      "1" = "Sí",
+      .default = NA_character_
+    )),
+
+    # Variables clínicas continuas
+    IMC = as.numeric(bmi),
+    `Niveles medios de glucosa` = as.numeric(avg_glucose_level),
+
+    # Comorbilidades
+    Hipertensión = as.factor(dplyr::recode(
+      as.character(hypertension),
+      "0" = "No",
+      "1" = "Sí",
+      .default = NA_character_
+    )),
+
+    `Enfermedad cardiaca` = as.factor(dplyr::recode(
+      as.character(heart_disease),
+      "0" = "No",
+      "1" = "Sí",
+      .default = NA_character_
+    )),
+
+    # Variables socio-demográficas
+    `Estado civil` = as.factor(dplyr::recode(
+      ever_married,
+      "No" = "No",
+      "Yes" = "Sí",
+      .default = NA_character_
+    )),
+
+    `Tipo trabajo` = as.factor(dplyr::recode(
+      work_type,
+      "children" = "Niños",
+      "Never_worked" = "Nunca trabajó",
+      "Govt_job" = "Público",
+      "Private" = "Privado",
+      "Self-employed" = "Autónomo",
+      .default = NA_character_
+    )),
+
+    `Tipo residencia` = as.factor(dplyr::recode(
+      Residence_type,
+      "Urban" = "Urbana",
+      "Rural" = "Rural",
+      .default = NA_character_
+    )),
+
+    `Estado tabaquismo` = as.factor(dplyr::recode(
+      smoking_status,
+      "never smoked" = "Nunca fumó",
+      "formerly smoked" = "Exfumador",
+      "smokes" = "Fumador",
+      "Unknown" = "Desconocido",
+      .default = NA_character_
+    ))
+  )
+
+DT::datatable(
+  stroke_base,
+  rownames = FALSE,
+  options = list(
+    pageLength = 10,
+    scrollX = TRUE,
+    dom = "Bfrtip",
+    buttons = c("copy", "csv", "excel", "pdf", "print")
+  ),
+  caption = "Tabla 4: Vista interactiva del dataset procesado (stroke_base)",
+  class = "display compact stripe hover"
+) %>%
+  DT::formatStyle(
+    columns = colnames(stroke_base),
+    fontSize = "12px"
+  )
+```
+
+
+
+## 3.2. Asociación entre valores perdidos de IMC e ictus
+
+En esta sección se analiza la posible asociación entre la presencia de valores perdidos en la variable IMC y la variable objetivo (ictus). Para ello, se construye una tabla de contingencia que distingue entre observaciones con y sin valores ausentes en IMC, desagregadas según la ocurrencia de ictus. Además de las frecuencias absolutas, se calculan los porcentajes dentro de cada categoría de ictus con el fin de facilitar la comparación. Finalmente, se aplica una prueba de independencia, **chi-cuadrado o test exacto de Fisher**, según corresponda, para evaluar si la ausencia de información en el IMC podría estar relacionada con la variable respuesta.
+
+```{r na_imc_vs_ictus, echo=TRUE, warning=FALSE, message=FALSE}
+
+# Tabla de contingencia con nombres claros
+tab_na <- table(
+  `Estado de IMC` = ifelse(is.na(stroke_base$IMC), "Perdido", "Registrado"),
+  `Ictus` = stroke_base$Ictus
+)
+
+# Porcentajes por columna (dentro de cada categoría de ictus)
+pct_na <- round(100 * prop.table(tab_na, 2), 2)
+
+# Dataframes
+df_tab <- as.data.frame.matrix(tab_na) %>%
+  tibble::rownames_to_column("Estado de IMC")
+
+df_pct <- as.data.frame.matrix(pct_na) %>%
+  tibble::rownames_to_column("Estado de IMC")
+
+cols_y <- setdiff(names(df_tab), "Estado de IMC")
+
+# Combinar N y %
+for (cc in cols_y) {
+  df_tab[[cc]] <- paste0(df_tab[[cc]], " (", df_pct[[cc]], "%)")
+}
+
+# Test estadístico
+chi_test <- suppressWarnings(chisq.test(tab_na, correct = FALSE))
+expected <- chi_test$expected
+
+if (any(expected < 5)) {
+  ft <- fisher.test(tab_na)
+  test_label <- paste0(
+    "Test exacto de Fisher | p = ",
+    format.pval(ft$p.value, digits = 3, eps = 1e-3)
+  )
+} else {
+  phi <- sqrt(unname(chi_test$statistic) / sum(tab_na))
+  test_label <- paste0(
+    "Test χ² | χ² = ", round(unname(chi_test$statistic), 3),
+    ", gl = ", unname(chi_test$parameter),
+    ", p = ", format.pval(chi_test$p.value, digits = 3, eps = 1e-3),
+    " | φ = ", round(phi, 3)
+  )
+}
+
+# Añadir resultado del test
+df_tab <- df_tab %>%
+  dplyr::mutate(dplyr::across(dplyr::all_of(cols_y), as.character)) %>%
+  dplyr::bind_rows(
+    tibble::tibble(
+      `Estado de IMC` = "Resultado del test",
+      !!!setNames(
+        c(test_label, rep("", length(cols_y) - 1)),
+        cols_y
+      )
+    )
+  )
+
+# Tabla final
+tabla_df <- df_tab
+
+tabla_grob <- tableGrob(
+  tabla_df,
+  rows = NULL,
+  theme = ttheme_minimal(
+    base_size = 12,
+    base_family = "Times New Roman",
+    core = list(
+      fg_params = list(
+        cex = 0.85,
+        col = "black"
+      ),
+      bg_params = list(
+        fill = "white",
+        col = "black",
+        lwd = 0.5
+      )
+    ),
+    colhead = list(
+      fg_params = list(
+        col = "white",
+        fontface = "bold",
+        cex = 0.9
+      ),
+      bg_params = list(
+        fill = "#2c3e50",
+        col = "black",
+        lwd = 0.5
+      )
+    )
+  )
+)
+
+# Cambiar nombres de columnas manualmente
+tabla_grob$grobs[[which(tabla_grob$layout$name == "colhead-fg")[1]]]$label <- "Estado de IMC"
+tabla_grob$grobs[[which(tabla_grob$layout$name == "colhead-fg")[2]]]$label <- "Ictus: No"
+tabla_grob$grobs[[which(tabla_grob$layout$name == "colhead-fg")[3]]]$label <- "Ictus: Sí"
+
+# Poner en negrita la última fila
+ultima_fila <- nrow(tabla_df)
+for (i in seq_len(ncol(tabla_df))) {
+  idx <- which(tabla_grob$layout$name == "core-fg" &
+                 tabla_grob$layout$t == ultima_fila + 1 &
+                 tabla_grob$layout$l == i)
+  tabla_grob$grobs[idx][[1]]$gp <- gpar(
+    fontsize = 10,
+    fontfamily = "Times New Roman"
+  )
+}
+
+# Primera columna en negrita
+for (fila in seq_len(nrow(tabla_df))) {
+  idx <- which(tabla_grob$layout$name == "core-fg" &
+                 tabla_grob$layout$t == fila + 1 &
+                 tabla_grob$layout$l == 1)
+  tabla_grob$grobs[idx][[1]]$gp <- gpar(
+    fontface = "bold",
+    fontsize = 10,
+    fontfamily = "Times New Roman"
+  )
+}
+
+# Ajustar anchos de columna
+tabla_grob$widths <- unit(c(5, 9, 5), "cm")
+
+# Mostrar en el documento
+grid.newpage()
+grid.draw(tabla_grob)
+
+# Guardar como PNG
+png("tabla_imc_ictus.png", width = 2400, height = 900, res = 200, bg = "white")
+grid.newpage()
+grid.draw(tabla_grob)
+dev.off()
+```
+
+
+# 4. Análisis exploratorio del dataset procesado.
+
+## 4.1 Distribución de IMC y Glucosa (Log_Glucosa) por grupo de edad.
+
+En esta sección se analiza la distribución de las variables numéricas principales del estudio —IMC y niveles de glucosa— en función de los grupos de edad definidos previamente. Para ello, se emplean histogramas con curvas de densidad superpuestas, lo que permite visualizar tanto la forma de la distribución como posibles asimetrías o multimodalidades dentro de cada grupo. Adicionalmente, se incorpora una transformación logarítmica de la variable glucosa con el objetivo de reducir la influencia de valores extremos y facilitar la identificación de patrones estructurales en su distribución. Este análisis resulta clave para evaluar la presencia de sesgos, colas largas o posibles valores atípicos antes de aplicar técnicas de tratamiento específicas.
+
+```{r dist_imc_glucosa, echo=TRUE, warning=FALSE, message=FALSE}
+
+df_eda <- stroke_base
+
+# Función auxiliar: histograma + densidad superpuesta (faceteado por grupo)
+plot_hist_density_facet <- function(df, var, grupo, bins = 30, xlab = var, titulo = NULL) {
+  ggplot(df, aes(x = .data[[var]])) +
+    geom_histogram(aes(y = after_stat(density)), bins = bins, na.rm = TRUE) +
+    geom_density(na.rm = TRUE) +
+    facet_wrap(vars(.data[[grupo]]), scales = "free_y") +
+    labs(title = titulo, x = xlab, y = "Densidad") +
+    theme_grey()
+}
+
+# IMC por grupo de edad
+plot_hist_density_facet(
+  df_eda,
+  var = "IMC",
+  grupo = "Grupos edad",
+  titulo = "Distribución de IMC por grupo de edad (histograma + densidad)"
+)
+
+# Glucosa por grupo de edad
+plot_hist_density_facet(
+  df_eda,
+  var = "Niveles medios de glucosa",
+  grupo = "Grupos edad",
+  xlab = "Niveles de glucosa",
+  titulo = "Distribución de glucosa por grupo de edad (histograma + densidad)"
+)
+
+# Transformación logarítmica de la glucosa
+df_eda_log <- df_eda %>%
+  dplyr::filter(
+    !is.na(`Niveles medios de glucosa`),
+    `Niveles medios de glucosa` > 0
+  ) %>%
+  dplyr::mutate(
+    log_glucosa = log(`Niveles medios de glucosa`)
+  )
+
+# Log(glucosa) por grupo de edad
+plot_hist_density_facet(
+  df_eda_log,
+  var = "log_glucosa",
+  grupo = "Grupos edad",
+  xlab = "Log(glucosa)",
+  titulo = "Distribución de Log(glucosa) por grupo de edad (histograma + densidad)"
+)
+```
+
+
+
+## 4.2. Detección estratificada de outliers mediante IQR.
+
+En esta sección se identifican los valores atípicos de las variables IMC y niveles de glucosa mediante el criterio del rango intercuartílico (IQR), aplicándolo de forma estratificada por grupo de edad. Para cada grupo se calculan los límites inferior y superior a partir de los cuartiles primero y tercero, permitiendo adaptar la detección de outliers a la distribución específica de cada tramo etario. Los outliers detectados son candidatos a ser tratados, no son errores seguros.
+
+```{r outliers_iqr_por_edad, echo=TRUE, warning=FALSE, message=FALSE}
+
+stroke_base_log <- stroke_base %>%
+  dplyr::mutate(
+    log_glucosa = log(pmax(`Niveles medios de glucosa`, 1e-6))
+  )
+
+limites_iqr_por_grupo <- function(df, var, grupo) {
+  df %>%
+    dplyr::group_by(.data[[grupo]]) %>%
+    dplyr::summarise(
+      q1   = quantile(.data[[var]], 0.25, na.rm = TRUE),
+      q3   = quantile(.data[[var]], 0.75, na.rm = TRUE),
+      iqr  = q3 - q1,
+      low  = q1 - 1.5 * iqr,
+      high = q3 + 1.5 * iqr,
+      .groups = "drop"
+    ) %>%
+    dplyr::select(dplyr::all_of(grupo), low, high)
+}
+
+marcar_outliers <- function(df, var, grupo, nombre_flag, sufijo) {
+  lim <- limites_iqr_por_grupo(df, var, grupo) %>%
+    dplyr::rename(
+      !!paste0("low_", sufijo) := low,
+      !!paste0("high_", sufijo) := high
+    )
+
+  low_col  <- paste0("low_", sufijo)
+  high_col <- paste0("high_", sufijo)
+
+  df %>%
+    dplyr::left_join(lim, by = grupo) %>%
+    dplyr::mutate(
+      !!nombre_flag := !is.na(.data[[var]]) &
+        (.data[[var]] < .data[[low_col]] | .data[[var]] > .data[[high_col]])
+    ) %>%
+    dplyr::select(-dplyr::all_of(c(low_col, high_col)))
+}
+
+stroke_qc <- stroke_base_log %>%
+  marcar_outliers("IMC", "Grupos edad", "IMC_outlier", "imc") %>%
+  marcar_outliers("Niveles medios de glucosa", "Grupos edad", "Glucosa_outlier", "glu") %>%
+  marcar_outliers("log_glucosa", "Grupos edad", "Log_glucosa_outlier", "log_glu")
+
+tabla_outliers <- tibble::tibble(
+  Variable = c("IMC", "Niveles medios de glucosa", "Log(glucosa)"),
+  Outliers = c(
+    sum(stroke_qc$IMC_outlier, na.rm = TRUE),
+    sum(stroke_qc$Glucosa_outlier, na.rm = TRUE),
+    sum(stroke_qc$Log_glucosa_outlier, na.rm = TRUE)
+  ),
+  Porcentaje = round(
+    100 * c(
+      mean(stroke_qc$IMC_outlier, na.rm = TRUE),
+      mean(stroke_qc$Glucosa_outlier, na.rm = TRUE),
+      mean(stroke_qc$Log_glucosa_outlier, na.rm = TRUE)
+    ), 2
+  )
+)
+
+tabla_df <- tabla_outliers
+
+tabla_grob <- tableGrob(
+  tabla_df,
+  rows = NULL,
+  theme = ttheme_minimal(
+    base_size = 12,
+    base_family = "Times New Roman",
+    core = list(
+      fg_params = list(
+        cex = 0.85,
+        col = "black"
+      ),
+      bg_params = list(
+        fill = "white",
+        col = "black",
+        lwd = 0.5
+      )
+    ),
+    colhead = list(
+      fg_params = list(
+        col = "white",
+        fontface = "bold",
+        cex = 0.9
+      ),
+      bg_params = list(
+        fill = "#2c3e50",
+        col = "black",
+        lwd = 0.7
+      )
+    )
+  )
+)
+
+# Primera columna en negrita
+for (fila in seq_len(nrow(tabla_df))) {
+  idx <- which(
+    tabla_grob$layout$name == "core-fg" &
+      tabla_grob$layout$t == fila + 1 &
+      tabla_grob$layout$l == 1
+  )
+  tabla_grob$grobs[idx][[1]]$gp <- gpar(
+    fontface = "bold",
+    fontsize = 12,
+    fontfamily = "Times New Roman"
+  )
+}
+
+# Ajustar anchos de columna
+tabla_grob$widths <- unit(c(8, 3, 3), "cm")
+
+# Mostrar en el .Rmd
+grid.newpage()
+grid.draw(tabla_grob)
+
+# Guardar como PNG
+png("tabla_outliers.png", width = 2200, height = 900, res = 200, bg = "white")
+grid.newpage()
+grid.draw(tabla_grob)
+dev.off()
+```
+
+
+## 4.3. Visualización de los outliers por grupo de edad.
+
+
+```{r boxplots_por_edad_outliers, echo=TRUE, warning=FALSE, message=FALSE}
+plot_outliers_boxplot <- function(df, y_var, color_var, titulo, subtitulo, y_lab) {
+  ggplot(df, aes(x = .data[["Grupos edad"]], y = .data[[y_var]], color = .data[[color_var]])) +
+    geom_boxplot(outlier.shape = NA) +
+    geom_jitter(alpha = 0.35, width = 0.15, size = 1.2) +
+    scale_color_manual(
+      values = c("grey", "red"),
+      labels = c("Normal", "Outlier")
+    ) +
+    labs(
+      title = titulo,
+      subtitle = subtitulo,
+      x = "Grupo de edad",
+      y = y_lab,
+      color = "Clasificación"
+    ) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+}
+
+# --- IMC ---
+p_outliers_imc <- plot_outliers_boxplot(
+  df = stroke_qc,
+  y_var = "IMC",
+  color_var = "IMC_outlier",
+  titulo = "Outliers de IMC por grupo de edad",
+  subtitulo = "Método: IQR por grupo (1.5*IQR)",
+  y_lab = "IMC"
+)
+
+print(p_outliers_imc)
+
+# --- Glucosa ---
+p_outliers_glu <- plot_outliers_boxplot(
+  df = stroke_qc,
+  y_var = "Niveles medios de glucosa",
+  color_var = "Glucosa_outlier",
+  titulo = "Outliers de glucosa por grupo de edad",
+  subtitulo = "Método: IQR por grupo (1.5*IQR)",
+  y_lab = "Niveles de glucosa"
+)
+
+print(p_outliers_glu)
+
+# --- Log(glucosa) ---
+p_outliers_log_glu <- plot_outliers_boxplot(
+  df = stroke_qc,
+  y_var = "log_glucosa",
+  color_var = "Log_glucosa_outlier",
+  titulo = "Outliers de Log(glucosa) por grupo de edad",
+  subtitulo = "Método: IQR por grupo aplicado a Log(glucosa)",
+  y_lab = "Log(glucosa)"
+)
+
+print(p_outliers_log_glu)
+```
+
+
+
+## 4.4. Comparación de cuatro estrategias de tratamiento de outliers.
+
+
+```{r outliers_4_metodos, echo=TRUE, warning=TRUE, message=TRUE}
+
+base_outliers <- stroke_qc
+
+# Helpers ---------------------------------------------------------------
+
+winsorizar_por_grupo <- function(x, grupo, probs = c(0.025, 0.975)) {
+  df <- data.frame(x = x, grupo = grupo)
+  df %>%
+    dplyr::group_by(grupo) %>%
+    dplyr::mutate(
+      q1 = stats::quantile(x, probs[1], na.rm = TRUE),
+      q2 = stats::quantile(x, probs[2], na.rm = TRUE),
+      x_w = dplyr::if_else(!is.na(x) & x < q1, q1,
+                           dplyr::if_else(!is.na(x) & x > q2, q2, x))
+    ) %>%
+    dplyr::ungroup() %>%
+    dplyr::pull(x_w)
+}
+
+winsorizar_upper_por_grupo <- function(x, grupo, prob = 0.975) {
+  df <- data.frame(x = x, grupo = grupo)
+  df %>%
+    dplyr::group_by(grupo) %>%
+    dplyr::mutate(
+      q_hi = stats::quantile(x, prob, na.rm = TRUE),
+      x_w = dplyr::if_else(!is.na(x) & x > q_hi, q_hi, x)
+    ) %>%
+    dplyr::ungroup() %>%
+    dplyr::pull(x_w)
+}
+
+imputar_mediana_grupo <- function(df, var, grupos) {
+  var <- rlang::ensym(var)
+  grupos_syms <- rlang::syms(grupos)
+  med_global <- stats::median(dplyr::pull(df, !!var), na.rm = TRUE)
+
+  df %>%
+    dplyr::group_by(!!!grupos_syms) %>%
+    dplyr::mutate(
+      .med = stats::median(!!var, na.rm = TRUE),
+      .med = dplyr::if_else(is.na(.med), med_global, .med),
+      !!var := dplyr::if_else(is.na(!!var), .med, !!var)
+    ) %>%
+    dplyr::ungroup() %>%
+    dplyr::select(-.med)
+}
+
+# LOG SEGURA: evita -Inf/NaN si hay glucosa <= 0
+add_log_glucosa <- function(df) {
+  df %>%
+    dplyr::mutate(
+      log_glucosa = log(pmax(`Niveles medios de glucosa`, 1e-6))
+    )
+}
+
+# BASELINE (sin tratar) para comparar -----------------------------------
+
+stroke_baseline_out <- base_outliers %>%
+  add_log_glucosa() %>%
+  dplyr::mutate(Metodo = "Baseline")
+
+# MÉTODO 1: Outliers -> NA -> Imputar (IMC y glucosa) -------------------
+
+stroke_m1_imputar <- base_outliers %>%
+  dplyr::mutate(
+    IMC = dplyr::if_else(IMC_outlier %in% TRUE, NA_real_, as.numeric(IMC)),
+    `Niveles medios de glucosa` = dplyr::if_else(
+      Glucosa_outlier %in% TRUE,
+      NA_real_,
+      as.numeric(`Niveles medios de glucosa`)
+    )
+  ) %>%
+  imputar_mediana_grupo(var = IMC, grupos = c("Género", "Grupos edad")) %>%
+  imputar_mediana_grupo(var = `Niveles medios de glucosa`, grupos = c("Grupos edad")) %>%
+  add_log_glucosa() %>%
+  dplyr::mutate(Metodo = "M1: Imputar (outlier->NA + mediana)")
+
+# MÉTODO 2: Winsor bilateral IMC y glucosa por grupo de edad ------------
+
+stroke_m2_winsor <- base_outliers %>%
+  dplyr::mutate(
+    IMC = winsorizar_por_grupo(as.numeric(IMC), `Grupos edad`, probs = c(0.025, 0.975)),
+    `Niveles medios de glucosa` = winsorizar_por_grupo(
+      as.numeric(`Niveles medios de glucosa`),
+      `Grupos edad`,
+      probs = c(0.025, 0.975)
+    )
+  ) %>%
+  add_log_glucosa() %>%
+  dplyr::mutate(Metodo = "M2: Winsorizar ambas (p2.5-p97.5)")
+
+# MÉTODO 3: Híbrido (IMC imputar + glucosa winsor) ----------------------
+
+stroke_m3_hibrido <- base_outliers %>%
+  dplyr::mutate(
+    IMC = dplyr::if_else(IMC_outlier %in% TRUE, NA_real_, as.numeric(IMC))
+  ) %>%
+  imputar_mediana_grupo(var = IMC, grupos = c("Género", "Grupos edad")) %>%
+  dplyr::mutate(
+    `Niveles medios de glucosa` = winsorizar_por_grupo(
+      as.numeric(`Niveles medios de glucosa`),
+      `Grupos edad`,
+      probs = c(0.025, 0.975)
+    )
+  ) %>%
+  add_log_glucosa() %>%
+  dplyr::mutate(Metodo = "M3: Híbrido (IMC imputar + glucosa winsor)")
+
+# MÉTODO 4: Plausibilidad IMC + winsor superior en Log(glucosa) ---------
+
+IMC_max_plausible <- 70
+IMC_min_adulto_plausible <- 15
+prob_winsor_jovenes <- 0.975
+
+stroke_m4_plausible <- base_outliers %>%
+  dplyr::mutate(
+    IMC_implausible = (as.numeric(IMC) > IMC_max_plausible) |
+      (as.numeric(IMC) < IMC_min_adulto_plausible),
+    IMC = dplyr::if_else(IMC_implausible, NA_real_, as.numeric(IMC))
+  ) %>%
+  imputar_mediana_grupo(var = IMC, grupos = c("Género", "Grupos edad")) %>%
+  add_log_glucosa() %>%
+  dplyr::mutate(
+    log_glucosa = dplyr::if_else(
+      `Grupos edad` == "16-34",
+      winsorizar_upper_por_grupo(log_glucosa, `Grupos edad`, prob = prob_winsor_jovenes),
+      log_glucosa
+    ),
+    Metodo = "M4: IMC plausibilidad + Log(glucosa) + winsor↑(16-34)"
+  )
+
+# COMPARACIÓN DE MÉTRICAS (por método y grupo de edad) ------------------
+
+tabla_metricas_edad <- dplyr::bind_rows(
+  stroke_baseline_out,
+  stroke_m1_imputar,
+  stroke_m2_winsor,
+  stroke_m3_hibrido,
+  stroke_m4_plausible
+) %>%
+  dplyr::mutate(
+    Metodo = stringr::str_trim(as.character(Metodo)),
+    `Grupos edad` = stringr::str_trim(as.character(`Grupos edad`))
+  ) %>%
+  dplyr::group_by(Metodo, `Grupos edad`) %>%
+  dplyr::summarise(
+    IMC_media = mean(IMC, na.rm = TRUE),
+    IMC_mediana = stats::median(IMC, na.rm = TRUE),
+    IMC_sd = stats::sd(IMC, na.rm = TRUE),
+    `Log(glucosa)_media` = mean(log_glucosa, na.rm = TRUE),
+    `Log(glucosa)_mediana` = stats::median(log_glucosa, na.rm = TRUE),
+    `Log(glucosa)_sd` = stats::sd(log_glucosa, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# CHECKS ----------------------------------------------------------------
+
+if (!any(tabla_metricas_edad$Metodo == "Baseline")) {
+  stop(paste(
+    "No existe Metodo == 'Baseline' en tabla_metricas_edad. Metodos:",
+    paste(unique(tabla_metricas_edad$Metodo), collapse = " | ")
+  ))
+}
+
+cols_metricas <- setdiff(names(tabla_metricas_edad), c("Metodo", "Grupos edad"))
+bad <- sapply(tabla_metricas_edad[cols_metricas], function(x) sum(!is.finite(x)))
+if (any(bad > 0)) {
+  stop(paste("Hay no-finitos en métricas:", paste(names(bad)[bad > 0], collapse = ", ")))
+}
+
+# Mostrar tabla para inspección en el knit
+tabla_metricas_edad
+```
+
+
+## 4.5. Evaluación comparativa de métricas tras el tratamiento de outliers.
+
+
+```{r comparar_metricas_outliers, echo=TRUE, warning=TRUE, message=TRUE}
+
+# Long desde la tabla de métricas
+tabla_long <- tabla_metricas_edad %>%
+  dplyr::mutate(
+    Metodo = stringr::str_trim(as.character(Metodo)),
+    `Grupos edad` = stringr::str_trim(as.character(`Grupos edad`))
+  ) %>%
+  tidyr::pivot_longer(
+    cols = -c(Metodo, `Grupos edad`),
+    names_to = "Metrica",
+    values_to = "Valor"
+  )
+
+# Detectar baseline sin depender del texto exacto
+metodos <- unique(tabla_long$Metodo)
+
+if ("Baseline" %in% metodos) {
+  baseline_method <- "Baseline"
+} else {
+  baseline_method <- metodos[stringr::str_detect(stringr::str_to_lower(metodos), "base")][1]
+  if (is.na(baseline_method)) baseline_method <- metodos[1]
+}
+
+baseline <- tabla_long %>%
+  dplyr::filter(Metodo == baseline_method) %>%
+  dplyr::select(`Grupos edad`, Metrica, Valor_base = Valor)
+
+tabla_long_delta <- tabla_long %>%
+  dplyr::left_join(baseline, by = c("Grupos edad", "Metrica")) %>%
+  dplyr::mutate(Delta = Valor - Valor_base) %>%
+  dplyr::filter(is.finite(Delta))
+
+if (nrow(tabla_long_delta) == 0) {
+  stop("No hay Delta finito para graficar (tabla_long_delta vacía).")
+}
+
+p <- ggplot(
+  tabla_long_delta,
+  aes(x = Metodo, y = Delta, group = `Grupos edad`, color = `Grupos edad`)
+) +
+  geom_hline(yintercept = 0) +
+  geom_line() +
+  geom_point() +
+  facet_wrap(~ Metrica, scales = "free_y") +
+  theme_bw() +
+  scale_x_discrete(labels = c("Baseline", "M1", "M2", "M3", "M4")) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(
+    title = paste0("Cambio frente a ", baseline_method, " en métricas por método y grupo de edad"),
+    x = "",
+    y = "Delta (frente a baseline)",
+    color = "Grupo de edad"
+  )
+
+# Forzar render
+out_png <- file.path(tempdir(), "comparar_metricas_outliers.png")
+ggsave(out_png, plot = p, width = 14, height = 7, dpi = 150)
+knitr::include_graphics(out_png)
+```
+
+
+
+## 4.6. Comparación visual de log-glucosa entre métodos de tratamiento.
+
+
+
+
+```{r boxplot_log_glucosa_metodos}
+
+tmp <- dplyr::bind_rows(
+  stroke_baseline_out,
+  stroke_m1_imputar,
+  stroke_m2_winsor,
+  stroke_m3_hibrido,
+  stroke_m4_plausible
+) %>%
+  dplyr::mutate(
+    log_glucosa = unname(as.numeric(log_glucosa)),
+    Metodo = as.character(Metodo),
+    `Grupos edad` = as.character(`Grupos edad`)
+  ) %>%
+  dplyr::filter(is.finite(log_glucosa))
+
+p <- ggplot(tmp, aes(x = Metodo, y = log_glucosa)) +
+  geom_boxplot(outlier.alpha = 0.2, outlier.size = 0.8) +
+  facet_wrap(~ `Grupos edad`, scales = "free_y", ncol = 4) +
+  theme_bw() +
+  scale_x_discrete(labels = c("Baseline", "M1", "M2", "M3", "M4")) +
+  theme(
+    axis.text.x = element_text(angle = 0, hjust = 0.5, size = 8),
+    strip.text = element_text(size = 9, face = "bold"),
+    plot.title = element_text(size = 12, face = "bold", hjust = 0.5),
+    panel.grid.minor = element_blank()
+  ) +
+  labs(
+    title = "Comparación de métodos: Log(glucosa) por grupo de edad",
+    x = "",
+    y = "Log(glucosa)"
+  )
+
+out_png <- file.path(tempdir(), "comparacion_metodos_log_glucosa.png")
+ggsave(out_png, plot = p, width = 12, height = 3.8, dpi = 150)
+knitr::include_graphics(out_png)
+```
+
+
+
+## 4.7. Comparación visual del IMC entre métodos de tratamiento.
+
+
+```{r boxplot_imc_metodos}
+
+tmp <- dplyr::bind_rows(
+  stroke_baseline_out,
+  stroke_m1_imputar,
+  stroke_m2_winsor,
+  stroke_m3_hibrido,
+  stroke_m4_plausible
+) %>%
+  dplyr::mutate(
+    Metodo = trimws(as.character(Metodo)),
+    `Grupos edad` = trimws(as.character(`Grupos edad`)),
+    IMC = as.numeric(IMC)
+  ) %>%
+  dplyr::filter(is.finite(IMC), !is.na(Metodo), Metodo != "")
+
+p <- ggplot(tmp, aes(x = Metodo, y = IMC)) +
+  geom_boxplot(outlier.alpha = 0.2, outlier.size = 0.8) +
+  facet_wrap(~ `Grupos edad`, scales = "free_y", ncol = 4) +
+  theme_bw() +
+  scale_x_discrete(labels = c("Baseline", "M1", "M2", "M3", "M4")) +
+  theme(
+    axis.text.x = element_text(angle = 0, hjust = 0.5, size = 8),
+    strip.text = element_text(size = 9, face = "bold"),
+    plot.title = element_text(size = 12, face = "bold", hjust = 0.5),
+    panel.grid.minor = element_blank()
+  ) +
+  labs(
+    title = "Comparación de métodos: IMC por grupo de edad",
+    x = "",
+    y = "IMC"
+  )
+
+out <- file.path(tempdir(), "boxplot_IMC_metodos.png")
+ggsave(out, plot = p, width = 12, height = 3.8, dpi = 150)
+knitr::include_graphics(out)
+```
+
+
+
+## 4.8. Resumen numérico final por grupos de edad.
+
+```{r eda_tabla_numericas_por_edad}
+
+stroke_mod <- stroke_m4_plausible
+vars_num_edad <- c("IMC", "log_glucosa")
+
+desc_num_edad <- stroke_mod %>%
+  dplyr::group_by(`Grupos edad`) %>%
+  dplyr::summarise(
+    dplyr::across(
+      dplyr::all_of(vars_num_edad),
+      list(
+        n    = ~sum(!is.na(.)),
+        min  = ~min(., na.rm = TRUE),
+        p01  = ~as.numeric(stats::quantile(., 0.01, na.rm = TRUE)),
+        q1   = ~as.numeric(stats::quantile(., 0.25, na.rm = TRUE)),
+        med  = ~stats::median(., na.rm = TRUE),
+        mean = ~mean(., na.rm = TRUE),
+        q3   = ~as.numeric(stats::quantile(., 0.75, na.rm = TRUE)),
+        p99  = ~as.numeric(stats::quantile(., 0.99, na.rm = TRUE)),
+        max  = ~max(., na.rm = TRUE),
+        sd   = ~stats::sd(., na.rm = TRUE),
+        iqr  = ~stats::IQR(., na.rm = TRUE)
+      ),
+      .names = "{.col}__{.fn}"
+    ),
+    .groups = "drop"
+  ) %>%
+  tidyr::pivot_longer(
+    cols = -`Grupos edad`,
+    names_to = c("Variable", "Estadistico"),
+    names_sep = "__",
+    values_to = "Valor"
+  ) %>%
+  tidyr::pivot_wider(
+    names_from = Estadistico,
+    values_from = Valor
+  ) %>%
+  dplyr::mutate(
+    dplyr::across(where(is.numeric), ~round(., 3)),
+    Variable = dplyr::recode(
+      Variable,
+      IMC = "IMC",
+      log_glucosa = "Log(glucosa)"
+    )
+  ) %>%
+  dplyr::select(`Grupos edad`, Variable, n, min, p01, q1, med, mean, q3, p99, max, sd, iqr) %>%
+  dplyr::arrange(Variable, `Grupos edad`) %>%
+  dplyr::rename(
+    N = n,
+    MIN = min,
+    P01 = p01,
+    Q1 = q1,
+    MED = med,
+    MEAN = mean,
+    Q3 = q3,
+    P99 = p99,
+    MAX = max,
+    SD = sd,
+    IQR = iqr
+  )
+
+mi_tabla_num <- desc_num_edad %>%
+  knitr::kable(
+    format = "html",
+    col.names = c("Grupos edad", "Variable", "N", "MIN", "P01", "Q1", "MED", "MEAN", "Q3", "P99", "MAX", "SD", "IQR"),
+    align = rep("c", 13),
+    escape = FALSE,
+    row.names = FALSE,
+  ) %>%
+  kableExtra::kable_styling(
+    bootstrap_options = c("striped", "hover", "bordered"),
+    full_width = FALSE,
+    position = "center",
+    font_size = 12
+  ) %>%
+  kableExtra::row_spec(
+    0,
+    bold = TRUE,
+    color = "white",
+    background = "#2c3e50"
+  ) %>%
+  kableExtra::column_spec(1, bold = TRUE, width = "3cm") %>%
+  kableExtra::column_spec(2, bold = TRUE, width = "3cm") %>%
+  kableExtra::column_spec(3:13, width = "2cm") %>%
+  kableExtra::collapse_rows(columns = 1, valign = "top")
+
+mi_tabla_num
+```
+
+
+## 4.9. Distribución final del IMC por grupo de edad.
+
+```{r imc_hist_densidad, echo=TRUE, warning=FALSE, message=FALSE}
+# ---------------------------
+# IMC
+# ---------------------------
+p1 <- ggplot(stroke_mod, aes(x = IMC)) +
+  geom_histogram(
+    aes(y = after_stat(density)),
+    bins = 30,
+    fill = "grey80",
+    color = "grey40",
+    linewidth = 0.2
+  ) +
+  geom_density(
+    na.rm = TRUE,
+    linewidth = 0.8,
+    color = "black"
+  ) +
+  facet_wrap(~ `Grupos edad`, ncol = 4) +
+  labs(
+    title = "IMC",
+    x = "IMC",
+    y = "Densidad"
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(linewidth = 0.2, colour = "grey88"),
+    strip.text = element_text(size = 9, face = "bold"),
+    axis.title = element_text(size = 10),
+    axis.text = element_text(size = 8),
+    plot.title = element_text(size = 11, face = "bold", hjust = 0.5)
+  )
+
+# ---------------------------
+# Log(glucosa)
+# ---------------------------
+p2 <- ggplot(stroke_mod, aes(x = log_glucosa)) +
+  geom_histogram(
+    aes(y = after_stat(density)),
+    bins = 30,
+    fill = "grey80",
+    color = "grey40",
+    linewidth = 0.2
+  ) +
+  geom_density(
+    na.rm = TRUE,
+    linewidth = 0.8,
+    color = "black"
+  ) +
+  facet_wrap(~ `Grupos edad`, ncol = 4) +
+  labs(
+    title = "Log(glucosa)",
+    x = "Log(glucosa)",
+    y = "Densidad"
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(linewidth = 0.2, colour = "grey88"),
+    strip.text = element_text(size = 9, face = "bold"),
+    axis.title = element_text(size = 10),
+    axis.text = element_text(size = 8),
+    plot.title = element_text(size = 11, face = "bold", hjust = 0.5)
+  )
+
+# ---------------------------
+# Combinar: 4 arriba + 4 abajo
+# ---------------------------
+wrap_plots(p1, p2, ncol = 1) +
+  plot_annotation(
+    title = "Distribución de IMC y log(glucosa) por grupos de edad tras el preprocesamiento"
+  )
+```
+
+
+
+# 5. Análisis estadístico y relaciones entre variables.
+
+
+## 5.1. Correlación entre variables numéricas mediante Spearman.
+
+En este apartado se analiza la relación entre las variables numéricas mediante la correlación de Spearman, ya que es adecuada cuando no se puede asumir normalidad o cuando las relaciones pueden no ser lineales. Para mantener la coherencia con el resto del análisis, se utiliza la variable de glucosa transformada en lugar de la original. Este análisis permite detectar posibles relaciones entre variables, así como redundancias o dependencias que podrían influir en el modelado posterior.
+
+```{r correlacion_spearman, echo=TRUE, warning=FALSE, message=FALSE}
+
+# 1) Selección de variables numéricas
+vars_num <- names(stroke_mod)[sapply(stroke_mod, is.numeric)]
+
+# Eliminar glucosa original (nos quedamos con log_glucosa)
+vars_num <- setdiff(vars_num, "Niveles medios de glucosa")
+
+num_df <- stroke_mod %>%
+  dplyr::select(dplyr::all_of(vars_num))
+
+# 2) Inicializar matrices
+var_names <- names(num_df)
+n_vars <- length(var_names)
+
+cor_spear <- matrix(NA_real_, n_vars, n_vars, dimnames = list(var_names, var_names))
+p_values  <- matrix(NA_real_, n_vars, n_vars, dimnames = list(var_names, var_names))
+
+# 3) Calcular rho y p-valor por pares
+for (i in seq_len(n_vars)) {
+  for (j in seq_len(n_vars)) {
+    if (i == j) {
+      cor_spear[i, j] <- 1
+      p_values[i, j]  <- NA
+    } else {
+      x <- num_df[[i]]
+      y <- num_df[[j]]
+      
+      complete_idx <- complete.cases(x, y)
+      x2 <- x[complete_idx]
+      y2 <- y[complete_idx]
+      
+      test <- suppressWarnings(
+        cor.test(x2, y2, method = "spearman", exact = FALSE)
+      )
+      
+      cor_spear[i, j] <- unname(test$estimate)
+      p_values[i, j]  <- test$p.value
+    }
+  }
+}
+
+# 4) Ajuste FDR
+upper_idx <- upper.tri(p_values, diag = FALSE)
+p_vec <- p_values[upper_idx]
+p_adj_vec <- p.adjust(p_vec, method = "fdr")
+
+p_adj <- matrix(NA_real_, n_vars, n_vars, dimnames = list(var_names, var_names))
+p_adj[upper_idx] <- p_adj_vec
+p_adj[lower.tri(p_adj)] <- t(p_adj)[lower.tri(p_adj)]
+
+# 5) Formato
+cor_spear <- round(cor_spear, 3)
+
+format_p <- function(p) {
+  if (is.na(p)) {
+    ""
+  } else if (p == 0 || p < .Machine$double.eps) {
+    "<2.2e-16"
+  } else if (p < 0.0001) {
+    formatC(p, format = "e", digits = 2)
+  } else {
+    formatC(p, format = "f", digits = 4)
+  }
+}
+
+p_adj_fmt <- matrix(
+  vapply(as.vector(p_adj), format_p, character(1)),
+  nrow = nrow(p_adj),
+  ncol = ncol(p_adj),
+  dimnames = dimnames(p_adj)
+)
+
+cor_fmt <- matrix(
+  formatC(cor_spear, format = "f", digits = 3),
+  nrow = nrow(cor_spear),
+  ncol = ncol(cor_spear),
+  dimnames = dimnames(cor_spear)
+)
+
+# 6) Tabla combinada
+cor_display <- matrix("", n_vars, n_vars, dimnames = list(var_names, var_names))
+
+for (i in seq_len(n_vars)) {
+  for (j in seq_len(n_vars)) {
+    if (i == j) {
+      cor_display[i, j] <- cor_fmt[i, j]
+    } else {
+      cor_display[i, j] <- paste0(cor_fmt[i, j], "<br>(", p_adj_fmt[i, j], ")")
+    }
+  }
+}
+
+cor_tbl <- as.data.frame(cor_display) %>%
+  tibble::rownames_to_column("Variable")
+
+n_cols <- ncol(cor_tbl)
+
+cor_tbl %>%
+  knitr::kable(
+    format = "html",
+    row.names = FALSE,
+    escape = FALSE
+  ) %>%
+  kableExtra::add_header_above(
+    c("Correlación Spearman (ρ) con p-ajustado FDR" = n_cols)
+  ) %>%
+  kableExtra::kable_styling(
+    bootstrap_options = c("striped", "hover", "bordered"),
+    full_width = FALSE,
+    position = "center",
+    font_size = 12
+  ) %>%
+  kableExtra::row_spec(
+    0,
+    bold = TRUE,
+    color = "white",
+    background = "#2c3e50"
+  ) %>%
+  kableExtra::column_spec(1, bold = TRUE, width = "3cm") %>%
+  kableExtra::column_spec(2:n_cols, width = "2.5cm")
+
+# 7) Heatmap
+cor_long <- reshape2::melt(cor_spear, varnames = c("Var1", "Var2"), value.name = "rho")
+p_long   <- reshape2::melt(p_adj,     varnames = c("Var1", "Var2"), value.name = "p_adj")
+
+cor_long <- dplyr::left_join(cor_long, p_long, by = c("Var1", "Var2"))
+
+cor_long$label <- ifelse(
+  cor_long$Var1 == cor_long$Var2,
+  formatC(cor_long$rho, format = "f", digits = 2),
+  paste0(
+    formatC(cor_long$rho, format = "f", digits = 2),
+    "\n(",
+    vapply(cor_long$p_adj, format_p, character(1)),
+    ")"
+  )
+)
+
+# Reetiquetar variables para visualización
+cor_long <- cor_long %>%
+  dplyr::mutate(
+    Var1 = dplyr::recode(
+      Var1,
+      log_glucosa = "Log(glucosa)"
+    ),
+    Var2 = dplyr::recode(
+      Var2,
+      log_glucosa = "Log(glucosa)"
+    )
+  )
+
+p <- ggplot(cor_long, aes(x = Var2, y = Var1, fill = rho)) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(aes(label = label), size = 3, fontface = "bold") +
+  scale_fill_gradient2(
+    low = "grey",
+    mid = "darkcyan",
+    high = "#2c3e50",
+    midpoint = 0,
+    limits = c(-1, 1),
+    name = "ρ (Spearman)"
+  ) +
+  labs(
+    title = "Correlación Spearman con p-ajustado (FDR)",
+    subtitle = "Formato: ρ (p-ajustado)",
+    x = "",
+    y = ""
+  ) +
+  theme_minimal() +
+  theme(
+  panel.grid = element_blank(),
+  axis.text.x = element_text(angle = 45, hjust = 1, face = "bold"),
+  axis.text.y = element_text(face = "bold"),
+  axis.text = element_text(size = 9),
+  plot.title = element_text(hjust = 0.5, face = "bold", size = 12),
+  plot.subtitle = element_text(hjust = 0.5, size = 10)
+)
+
+p
+```
+
+
+
+## 5.2 Asociación entre ictus y variables categóricas.
+
+En este apartado se evalúa la relación entre la variable ictus y diversas variables categóricas mediante tablas de contingencia. El objetivo es identificar factores cualitativos que puedan estar asociados a la ocurrencia del ictus. Para ello, se combinan contrastes de independencia basados en el test de chi-cuadrado con medidas de tamaño del efecto como el coeficiente V de Cramer. De este modo, no solo se analiza la significación estadística de las asociaciones, sino también su magnitud práctica.
+
+```{r chi2_cramer_ictus, echo=TRUE, warning=FALSE, message=FALSE}
+
+stroke_mod <- stroke_mod %>%
+  dplyr::mutate(
+    IMC_cat = factor(dplyr::case_when(
+      is.na(IMC) ~ NA_character_,
+      IMC < 18.5 ~ "Peso bajo",
+      IMC <= 24.99 ~ "Peso normal",
+      IMC <= 29.99 ~ "Sobrepeso",
+      TRUE ~ "Obesidad"
+    ))
+  )
+
+lF <- stroke_mod %>%
+  dplyr::select(
+    Ictus,
+    `Género`, `Grupos edad`, IMC_cat,
+    Hipertensión, `Enfermedad cardiaca`, `Estado civil`,
+    `Tipo trabajo`, `Tipo residencia`, `Estado tabaquismo`
+  ) %>%
+  dplyr::mutate(dplyr::across(dplyr::everything(), as.factor)) %>%
+  droplevels()
+
+vars_pred <- setdiff(names(lF), "Ictus")
+
+m <- data.frame(
+  Variable = vars_pred,
+  p_valor = NA_real_,
+  p_ajustado = NA_real_,
+  Cramer_V = NA_real_,
+  stringsAsFactors = FALSE
+)
+
+cramer_v <- function(tabla) {
+  chi <- suppressWarnings(chisq.test(tabla, correct = FALSE))
+  n <- sum(tabla)
+  k <- min(dim(tabla))
+  as.numeric(sqrt(chi$statistic / (n * (k - 1))))
+}
+
+for (v in vars_pred) {
+  tabla <- table(lF$Ictus, lF[[v]])
+  test <- suppressWarnings(chisq.test(tabla, correct = FALSE))
+  
+  if (any(test$expected < 5)) {
+    test <- suppressWarnings(chisq.test(tabla, simulate.p.value = TRUE, B = 2000))
+  }
+  
+  m[m$Variable == v, "p_valor"] <- test$p.value
+  m[m$Variable == v, "Cramer_V"] <- cramer_v(tabla)
+}
+
+# Ajuste FDR
+m$p_ajustado <- p.adjust(m$p_valor, method = "fdr")
+
+m_fmt <- m %>%
+  dplyr::mutate(
+    Variable = dplyr::recode(
+      Variable,
+      IMC_cat = "Categoría IMC"
+    ),
+    p_valor_num = p_valor,
+    p_ajustado_num = p_ajustado,
+    p_valor_txt = ifelse(
+      p_valor_num < 0.001,
+      "<0.001",
+      format(round(p_valor_num, 6), scientific = TRUE)
+    ),
+    p_ajustado_txt = ifelse(
+      p_ajustado_num < 0.001,
+      "<0.001",
+      format(round(p_ajustado_num, 6), scientific = TRUE)
+    ),
+    p_valor_txt = ifelse(
+      p_valor_num < 0.05,
+      kableExtra::cell_spec(p_valor_txt, "html", bold = TRUE),
+      p_valor_txt
+    ),
+    p_ajustado_txt = ifelse(
+      p_ajustado_num < 0.05,
+      kableExtra::cell_spec(p_ajustado_txt, "html", bold = TRUE),
+      p_ajustado_txt
+    ),
+    Cramer_V = round(Cramer_V, 3),
+    Cramer_V = ifelse(
+      Cramer_V > 0.3,
+      kableExtra::cell_spec(Cramer_V, "html", bold = TRUE),
+      as.character(Cramer_V)
+    )
+  ) %>%
+  dplyr::select(Variable, p_valor = p_valor_txt, p_ajustado = p_ajustado_txt, Cramer_V)
+
+n_cols <- ncol(m_fmt)
+
+# Renombrar columnas (antes del kable)
+colnames(m_fmt) <- colnames(m_fmt) %>%
+  gsub("_", " ", .) %>%                  # quitar _
+  gsub("p valor", "p-valor", .) %>%     
+  gsub("p ajustado", "p-ajustado", .) %>%
+  gsub("Cramer V", "V de Cramer", .)
+
+# Tabla
+m_fmt %>%
+  knitr::kable(
+    format = "html",
+    row.names = FALSE,
+    escape = FALSE,
+    align = rep("c", n_cols)
+  ) %>%
+  kableExtra::add_header_above(
+    c("Contrastes de asociación y V de Cramer (Ictus vs categóricas)" = n_cols)
+  ) %>%
+  kableExtra::kable_styling(
+    bootstrap_options = c("striped", "hover", "bordered"),
+    full_width = FALSE,
+    position = "center",
+    font_size = 12
+  ) %>%
+  kableExtra::row_spec(
+    0,
+    bold = TRUE,
+    color = "white",
+    background = "#2c3e50"
+  ) %>%
+  kableExtra::column_spec(1, bold = TRUE, width = "5cm") %>%
+  kableExtra::column_spec(2:n_cols, width = "2.5cm") %>%
+  kableExtra::row_spec(
+    0:nrow(m_fmt),
+    extra_css = "border: 1px solid black;"
+  )
+```
+
+
+## 5.3. Distribución de variables categóricas según ictus.
+
+En este apartado se analizan las distribuciones de las variables categóricas en función de la presencia de ictus. Para ello, se representan las proporciones de cada categoría dentro de cada grupo mediante gráficos de barras normalizados. Esta visualización permite comparar la distribución relativa de las categorías entre pacientes con y sin ictus, facilitando la identificación de posibles diferencias y patrones relevantes en las variables cualitativas.
+
+```{r distribucion_categoricas_por_ictus}
+# Datos en formato largo
+datos_cat_plot <- stroke_mod %>%
+  dplyr::select(
+    Ictus,
+    `Género`, `Grupos edad`, IMC_cat,
+    Hipertensión, `Enfermedad cardiaca`, `Estado civil`,
+    `Tipo trabajo`, `Tipo residencia`, `Estado tabaquismo`
+  ) %>%
+  tidyr::pivot_longer(
+    cols = -Ictus,
+    names_to = "Variable",
+    values_to = "Categoria"
+  ) %>%
+  dplyr::filter(!is.na(Categoria)) %>%
+  dplyr::mutate(
+    Variable = factor(
+      Variable,
+      levels = c(
+        "Género", "Grupos edad", "IMC_cat",
+        "Hipertensión", "Enfermedad cardiaca", "Estado civil",
+        "Tipo trabajo", "Tipo residencia", "Estado tabaquismo"
+      ),
+      labels = c(
+        "Género", "Grupos de edad", "Categoría IMC",
+        "Hipertensión", "Enfermedad cardiaca", "Estado civil",
+        "Tipo de trabajo", "Tipo de residencia", "Estado de tabaquismo"
+      )
+    )
+  )
+
+# Gráfico de proporciones
+ggplot(datos_cat_plot, aes(x = Categoria, fill = Ictus)) +
+  geom_bar(position = "fill") +
+  facet_wrap(~ Variable, scales = "free_x", ncol = 3) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  scale_fill_manual(
+    values = c("#B8D0E8", "#0A2942"),
+    labels = c("No", "Sí")
+  ) +
+  labs(
+    title = "Distribución de variables categóricas según ictus",
+    x = "Categoría",
+    y = "Proporción",
+    fill = "Ictus"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(face = "bold")
+  )
+```
+
+
+## 5.4. Asociación entre variables categóricas mediante V de Cramer.
+
+En este apartado se amplía el análisis de las variables categóricas mediante el cálculo del coeficiente V de Cramer para distintos pares de variables cualitativas. El objetivo es identificar posibles dependencias internas dentro del dataset más allá de la relación con la variable respuesta. Los resultados se representan mediante un heatmap, que permite visualizar de forma sintética el grado de asociación entre variables. Esta matriz facilita la detección de patrones de relación y posibles redundancias estructurales entre las variables analizadas.
+
+```{r cramer_heatmap}
+# EDA: heatmap de V de Cramer entre categóricas
+vars_all <- names(lF)  # incluye Ictus y categóricas
+
+cramers_v_pair <- function(x, y) {
+  tab <- table(x, y)
+  if (sum(tab) == 0) return(NA_real_)
+  chi <- suppressWarnings(chisq.test(tab, correct = FALSE))
+  n <- sum(tab)
+  k <- min(dim(tab))
+  sqrt(as.numeric(chi$statistic) / (n * (k - 1)))
+}
+
+# Matriz
+V <- matrix(
+  NA_real_,
+  nrow = length(vars_all),
+  ncol = length(vars_all),
+  dimnames = list(vars_all, vars_all)
+)
+
+for (i in seq_along(vars_all)) {
+  for (j in seq_along(vars_all)) {
+    if (i == j) {
+      V[i, j] <- 1
+    } else {
+      V[i, j] <- cramers_v_pair(lF[[vars_all[i]]], lF[[vars_all[j]]])
+    }
+  }
+}
+
+V_long <- as.data.frame(V) %>%
+  tibble::rownames_to_column("Var1") %>%
+  tidyr::pivot_longer(-Var1, names_to = "Var2", values_to = "CramersV") %>%
+  dplyr::mutate(
+    Var1 = dplyr::recode(
+      Var1,
+      IMC_cat = "Categoría IMC"
+    ),
+    Var2 = dplyr::recode(
+      Var2,
+      IMC_cat = "Categoría IMC"
+    )
+  )
+
+ggplot(V_long, aes(x = Var1, y = Var2, fill = CramersV)) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  scale_fill_gradient(
+    low = "grey90",
+    high = "#2c3e50",
+    limits = c(0, 1),
+    name = "V de Cramér"
+  ) +
+  labs(
+    title = "Heatmap de V de Cramér (categóricas vs categóricas)",
+    x = "",
+    y = ""
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.text = element_text(size = 9),
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 12)
+  )
+```
+
+
+## 5.5. Asociación entre variables categóricas y numéricas.
+
+Se estudia la relación entre variables categóricas y numéricas utilizando pruebas no paramétricas y medidas de tamaño del efecto, con el objetivo de detectar patrones relevantes que puedan aportar información al modelado.
+
+
+```{r asociacion_categoricas_numericas}
+
+# ---- elige aquí las categóricas (factor/character menos Ictus y/o IDs) ----
+vars_cat <- names(stroke_mod)[sapply(stroke_mod, function(z) is.factor(z) || is.character(z))]
+vars_cat <- setdiff(vars_cat, c("Ictus", "ID", "Metodo"))
+
+# ---- tamaños de efecto ----
+# Rank-biserial estable (grupo2 vs grupo1): rb = 2*U2/(n1*n2) - 1
+rank_biserial <- function(x, g) {
+  df <- data.frame(x = x, g = as.factor(g)) %>% dplyr::filter(!is.na(x), !is.na(g))
+  if (nlevels(df$g) != 2) return(NA_real_)
+  lev <- levels(df$g)
+  x1 <- df$x[df$g == lev[1]]
+  x2 <- df$x[df$g == lev[2]]
+  n1 <- length(x1); n2 <- length(x2)
+  if (n1 == 0 || n2 == 0) return(NA_real_)
+
+  r <- rank(c(x1, x2), ties.method = "average")
+  r2 <- sum(r[(n1 + 1):(n1 + n2)])
+  U2 <- r2 - n2 * (n2 + 1) / 2
+  2 * U2 / (n1 * n2) - 1
+}
+
+# Epsilon squared (Kruskal): ε² = (H - k + 1) / (n - k)
+epsilon_sq <- function(x, g) {
+  df <- data.frame(x = x, g = as.factor(g)) %>% dplyr::filter(!is.na(x), !is.na(g))
+  k <- nlevels(df$g); n <- nrow(df)
+  if (k < 2 || n <= k) return(NA_real_)
+  H <- as.numeric(suppressWarnings(kruskal.test(x ~ g, data = df)$statistic))
+  max(0, (H - k + 1) / (n - k))
+}
+
+assoc_cat_num <- function(x, g) {
+  df <- data.frame(x = x, g = as.factor(g)) %>% dplyr::filter(!is.na(x), !is.na(g))
+  k <- nlevels(df$g)
+  if (k < 2) return(list(p = NA_real_, eff = NA_real_, metodo = NA_character_, k = k))
+
+  if (k == 2) {
+    p <- suppressWarnings(wilcox.test(x ~ g, data = df, exact = FALSE)$p.value)
+    eff <- rank_biserial(df$x, df$g)
+    list(p = p, eff = eff, metodo = "Wilcoxon + rb", k = k)
+  } else {
+    p <- suppressWarnings(kruskal.test(x ~ g, data = df)$p.value)
+    eff <- epsilon_sq(df$x, df$g)
+    list(p = p, eff = eff, metodo = "Kruskal + ε²", k = k)
+  }
+}
+
+# ---- construir tabla ----
+res <- lapply(vars_cat, function(v) {
+  a_imc <- assoc_cat_num(stroke_mod$IMC, stroke_mod[[v]])
+  a_log_glu <- assoc_cat_num(stroke_mod$log_glucosa, stroke_mod[[v]])
+
+  tibble::tibble(
+    Variable = v,
+    Niveles_IMC = a_imc$k,
+    Metodo_IMC  = a_imc$metodo,
+    p_IMC       = a_imc$p,
+    Efecto_IMC  = a_imc$eff,
+    Niveles_LogGlu = a_log_glu$k,
+    Metodo_LogGlu  = a_log_glu$metodo,
+    p_LogGlu       = a_log_glu$p,
+    Efecto_LogGlu  = a_log_glu$eff
+  )
+}) %>% dplyr::bind_rows()
+
+# ---- p-ajustada (FDR) por bloque ----
+res <- res %>%
+  dplyr::mutate(
+    p_IMC_adj = p.adjust(p_IMC, method = "fdr"),
+    p_LogGlu_adj = p.adjust(p_LogGlu, method = "fdr")
+  )
+
+# ---- formateo ----
+fmt_p <- function(p) ifelse(is.na(p), "NA", ifelse(p < 0.001, "<0.001", format(round(p, 6), scientific = TRUE)))
+
+res_fmt <- res %>%
+  dplyr::mutate(
+    Variable = dplyr::recode(
+      Variable,
+      IMC_cat = "Categoría IMC",
+      log_glucosa = "Log(glucosa)"
+    ),
+    p_IMC_txt  = fmt_p(p_IMC),
+    p_IMC_adj_txt = fmt_p(p_IMC_adj),
+    p_LogGlu_txt  = fmt_p(p_LogGlu),
+    p_LogGlu_adj_txt = fmt_p(p_LogGlu_adj),
+
+    # redondeo efectos
+    Efecto_IMC = round(Efecto_IMC, 3),
+    Efecto_LogGlu = round(Efecto_LogGlu, 3),
+
+    # resaltados solo en HTML
+    p_IMC_txt = ifelse(!is.na(p_IMC) & p_IMC < 0.05 & knitr::is_html_output(),
+                       kableExtra::cell_spec(p_IMC_txt, "html", bold = TRUE), p_IMC_txt),
+    p_IMC_adj_txt = ifelse(!is.na(p_IMC_adj) & p_IMC_adj < 0.05 & knitr::is_html_output(),
+                           kableExtra::cell_spec(p_IMC_adj_txt, "html", bold = TRUE), p_IMC_adj_txt),
+    p_LogGlu_txt = ifelse(!is.na(p_LogGlu) & p_LogGlu < 0.05 & knitr::is_html_output(),
+                          kableExtra::cell_spec(p_LogGlu_txt, "html", bold = TRUE), p_LogGlu_txt),
+    p_LogGlu_adj_txt = ifelse(!is.na(p_LogGlu_adj) & p_LogGlu_adj < 0.05 & knitr::is_html_output(),
+                              kableExtra::cell_spec(p_LogGlu_adj_txt, "html", bold = TRUE), p_LogGlu_adj_txt),
+
+    # resaltar efectos moderados/altos
+    Efecto_IMC_txt = ifelse(!is.na(Efecto_IMC) & abs(Efecto_IMC) >= 0.30 & knitr::is_html_output(),
+                            kableExtra::cell_spec(as.character(Efecto_IMC), "html", bold = TRUE),
+                            as.character(Efecto_IMC)),
+    Efecto_LogGlu_txt = ifelse(!is.na(Efecto_LogGlu) & abs(Efecto_LogGlu) >= 0.30 & knitr::is_html_output(),
+                               kableExtra::cell_spec(as.character(Efecto_LogGlu), "html", bold = TRUE),
+                               as.character(Efecto_LogGlu))
+  ) %>%
+  dplyr::transmute(
+    Variable,
+    `IMC: niveles` = Niveles_IMC,
+    `IMC: método`  = Metodo_IMC,
+    `IMC: p`       = p_IMC_txt,
+    `IMC: p_adj`   = p_IMC_adj_txt,
+    `IMC: efecto`  = Efecto_IMC_txt,
+    `Log(glucosa): niveles` = Niveles_LogGlu,
+    `Log(glucosa): método`  = Metodo_LogGlu,
+    `Log(glucosa): p`       = p_LogGlu_txt,
+    `Log(glucosa): p_adj`   = p_LogGlu_adj_txt,
+    `Log(glucosa): efecto`  = Efecto_LogGlu_txt
+  ) %>%
+  dplyr::arrange(Variable)
+
+# ---- render tabla ----
+# ---- tabla IMC ----
+tabla_imc <- res_fmt %>%
+  dplyr::select(Variable, starts_with("IMC")) %>%
+  dplyr::mutate(
+    Variable = gsub("_", " ", Variable)
+  )
+
+# ---- tabla Log(glucosa) ----
+tabla_glucosa <- res_fmt %>%
+  dplyr::select(Variable, starts_with("Log")) %>%
+  dplyr::mutate(
+    Variable = gsub("_", " ", Variable)
+  )
+
+tabla_imc %>%
+  knitr::kable(
+    format = "html",
+    escape = FALSE,
+    row.names = FALSE,
+    align = rep("c", ncol(tabla_imc))
+  ) %>%
+  kableExtra::kable_styling(
+    bootstrap_options = c("striped", "hover", "bordered"),
+    full_width = FALSE,
+    position = "center",
+    font_size = 12
+  ) %>%
+  kableExtra::row_spec(
+    0,
+    bold = TRUE,
+    color = "white",
+    background = "#2c3e50"
+  ) %>%
+  kableExtra::column_spec(1, bold = TRUE, width = "14em") %>%
+  kableExtra::column_spec(2:ncol(tabla_imc), width = "7em") %>%
+  kableExtra::row_spec(
+    0:nrow(tabla_imc),
+    extra_css = "border: 1px solid black;"
+  )
+
+tabla_glucosa %>%
+  knitr::kable(
+    format = "html",
+    escape = FALSE,
+    row.names = FALSE,
+    align = rep("c", ncol(tabla_glucosa))
+  ) %>%
+  kableExtra::kable_styling(
+    bootstrap_options = c("striped", "hover", "bordered"),
+    full_width = FALSE,
+    position = "center",
+    font_size = 12
+  ) %>%
+  kableExtra::row_spec(
+    0,
+    bold = TRUE,
+    color = "white",
+    background = "#2c3e50"
+  ) %>%
+  kableExtra::column_spec(1, bold = TRUE, width = "12em") %>%
+  kableExtra::column_spec(2:ncol(tabla_glucosa), width = "9em") %>%
+  kableExtra::row_spec(
+    0:nrow(tabla_glucosa),
+    extra_css = "border: 1px solid black;"
+  )
+```
+
+
+
+
+## 5.6. Comparación de variables numéricas según presencia de ictus.
+
+En este apartado se comparan las distribuciones de las variables numéricas (edad, IMC y glucosa logarítmica) entre pacientes con y sin ictus, con el objetivo de evaluar si existen diferencias relevantes en función de la variable respuesta. Para ello, se emplea la **prueba de Wilcoxon**, ya que constituye una alternativa robusta cuando no es adecuado asumir normalidad en las variables analizadas. Además del p-valor, se incorporan resúmenes descriptivos y formatos de presentación que facilitan la interpretación de los resultados.
+
+```{r wilcoxon_num_vs_ictus, echo=TRUE, warning=FALSE, message=FALSE}
+
+# 1. Verificar que log_glucosa existe
+if (!"log_glucosa" %in% names(stroke_mod)) {
+  stop("La variable 'log_glucosa' no está en stroke_mod. Revisa los chunks anteriores.")
+}
+
+# 2. Asegurar que Ictus es factor con niveles correctos
+stroke_mod <- stroke_mod %>%
+  dplyr::mutate(Ictus = factor(Ictus, levels = c("No", "Sí")))
+
+# 3. Verificar que hay al menos un caso con Ictus == "Sí"
+if (sum(stroke_mod$Ictus == "Sí", na.rm = TRUE) == 0) {
+  stop("No hay observaciones con Ictus == 'Sí' en stroke_mod. Revisa el preprocesamiento.")
+}
+
+# Helpers
+fmt_p <- function(p) {
+  ifelse(is.na(p), "NA", ifelse(p < 0.001, "<0.001", format(round(p, 6), scientific = TRUE)))
+}
+
+med_iqr <- function(x) {
+  m <- median(x, na.rm = TRUE)
+  q <- stats::quantile(x, c(.25, .75), na.rm = TRUE, names = FALSE)
+  sprintf("%.2f (%.2f–%.2f)", m, q[1], q[2])
+}
+
+rb_eff <- function(x_no, x_si) {
+  x_no <- x_no[!is.na(x_no)]
+  x_si <- x_si[!is.na(x_si)]
+  n1 <- length(x_no)
+  n2 <- length(x_si)
+  if (n1 == 0 || n2 == 0) return(NA_real_)
+  r <- rank(c(x_no, x_si), ties.method = "average")
+  r_si <- sum(r[(n1 + 1):(n1 + n2)])
+  U2 <- r_si - n2 * (n2 + 1) / 2
+  2 * U2 / (n1 * n2) - 1
+}
+
+vars_num <- c("Edad", "IMC", "log_glucosa")
+
+# Data frame con nombres simples
+res <- data.frame(
+  Variable = vars_num,
+  n_No = NA_integer_,
+  n_Si = NA_integer_,
+  med_no = NA_character_,
+  med_si = NA_character_,
+  diff_med = NA_real_,
+  p = NA_real_,
+  p_adj = NA_real_,
+  rb = NA_real_,
+  stringsAsFactors = FALSE
+)
+
+for (i in seq_along(vars_num)) {
+  v <- vars_num[i]
+  
+  x_no <- stroke_mod[[v]][stroke_mod$Ictus == "No"]
+  x_si <- stroke_mod[[v]][stroke_mod$Ictus == "Sí"]
+  
+  x_no <- x_no[!is.na(x_no)]
+  x_si <- x_si[!is.na(x_si)]
+  n_no <- length(x_no)
+  n_si <- length(x_si)
+  
+  res$n_No[i] <- n_no
+  res$n_Si[i] <- n_si
+  
+  if (n_no >= 2 && n_si >= 2) {
+    w <- stats::wilcox.test(x_no, x_si, exact = FALSE)
+    res$med_no[i] <- med_iqr(x_no)
+    res$med_si[i] <- med_iqr(x_si)
+    res$diff_med[i] <- median(x_si, na.rm = TRUE) - median(x_no, na.rm = TRUE)
+    res$p[i] <- w$p.value
+    res$rb[i] <- rb_eff(x_no, x_si)
+  } else {
+    warning(
+      paste(
+        "Variable", v, ": grupo Sí tiene", n_si,
+        "observaciones válidas (necesita al menos 2). No se calcula la prueba."
+      )
+    )
+  }
+}
+
+res$p_adj <- p.adjust(res$p, method = "fdr")
+
+# Formateo final
+res_fmt <- res %>%
+  dplyr::mutate(
+    Variable = dplyr::recode(
+      Variable,
+      log_glucosa = "Log(glucosa)"
+    ),
+    p_txt = fmt_p(p),
+    p_adj_txt = fmt_p(p_adj),
+    p_txt = ifelse(!is.na(p) & p < 0.05, kableExtra::cell_spec(p_txt, "html", bold = TRUE), p_txt),
+    p_adj_txt = ifelse(!is.na(p_adj) & p_adj < 0.05, kableExtra::cell_spec(p_adj_txt, "html", bold = TRUE), p_adj_txt),
+    diff_med = round(diff_med, 3),
+    rb = round(rb, 3)
+  ) %>%
+  dplyr::select(
+    Variable,
+    `n (No)` = n_No,
+    `n (Sí)` = n_Si,
+    `Mediana(IQR) No` = med_no,
+    `Mediana(IQR) Sí` = med_si,
+    `Dif mediana (Sí-No)` = diff_med,
+    p_valor = p_txt,
+    p_adj_FDR = p_adj_txt,
+    efecto_rb = rb
+  )
+
+# Mostrar tabla
+n_cols <- ncol(res_fmt)
+
+res_fmt %>%
+  knitr::kable(
+    format = "html",
+    escape = FALSE,
+    row.names = FALSE,
+    align = rep("c", ncol(res_fmt))
+  ) %>%
+  kableExtra::kable_styling(
+    bootstrap_options = c("hover", "bordered"),
+    full_width = FALSE,
+    position = "center",
+    font_size = 14
+  ) %>%
+  kableExtra::column_spec(1, bold = TRUE, width = "7em") %>%   # Variable
+  kableExtra::column_spec(2:3, width = "7em") %>%               # n(No), n(Sí)
+  kableExtra::column_spec(4:5, width = "15em") %>%              # Mediana(IQR)
+  kableExtra::column_spec(6, width = "16em") %>%                # Dif mediana
+  kableExtra::column_spec(7:8, width = "6em") %>%               # p y p_adj
+  kableExtra::column_spec(9, width = "6em") %>%                 # efecto_rb
+  kableExtra::row_spec(
+    0,
+    bold = TRUE,
+    color = "white",
+    background = "#2c3e50"
+  ) %>%
+  kableExtra::row_spec(
+    0:nrow(res_fmt),
+    extra_css = "border: 1px solid black;"
+  )
+```
+
+## 5.7. Distribución de variables numéricas según ictus.
+
+En este apartado se representan las distribuciones de las variables numéricas (edad, IMC y glucosa logarítmica) en función de la presencia de ictus. Para ello, se emplean diagramas de violín combinados con boxplots, lo que permite visualizar simultáneamente la forma de la distribución, la dispersión y los estadísticos principales de cada variable.
+
+```{r distribucion_vars_numericas_por_ictus}
+datos_plot <- stroke_mod %>%
+  dplyr::select(Ictus, Edad, IMC, log_glucosa) %>%
+  tidyr::pivot_longer(
+    cols = c(Edad, IMC, log_glucosa),
+    names_to = "Variable",
+    values_to = "Valor"
+  ) %>%
+  dplyr::filter(!is.na(Valor)) %>%
+  dplyr::mutate(
+    Ictus = factor(Ictus, levels = c("No", "Sí")),
+    Variable = factor(
+      Variable,
+      levels = c("Edad", "IMC", "log_glucosa"),
+      labels = c("Edad", "IMC", "Log(glucosa)")
+    )
+  )
+
+ggplot(datos_plot, aes(x = Ictus, y = Valor, fill = Ictus)) +
+  geom_violin(trim = FALSE, alpha = 0.4, color = NA) +
+  geom_boxplot(width = 0.18, outlier.shape = NA, alpha = 0.8) +
+  facet_wrap(~ Variable, scales = "free_y", ncol = 3) +
+  scale_fill_manual(
+    values = c("No" = "darkcyan", "Sí" = "grey")
+  ) +
+  labs(
+    title = "Distribución de variables numéricas según ictus",
+    x = "Ictus",
+    y = "Valor"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    strip.text = element_text(face = "bold")
+  )
+```
+
+# 6. Análisis del target y balance de clases
+
+
+## 6.1. Evaluación del desbalance de clases en la variable objetivo.
+
+En este apartado se evalúa el desbalance de la variable objetivo (Ictus) comparando el dataset base con el dataset final de modelado. Para ello, se resume el número total de observaciones, la frecuencia de casos con y sin ictus, el porcentaje de la clase positiva y la razón entre ambas clases. Este análisis permite cuantificar el grado de desbalance y justificar la necesidad de incorporar técnicas de balanceo en las etapas posteriores de modelado.
+
+```{r balance_clases, echo=TRUE, warning=FALSE, message=FALSE}
+# EDA: balance de clases (prevalencia de Ictus)
+balance_resumen <- function(df, nombre) {
+  data.frame(
+    Dataset = nombre,
+    N_Total = nrow(df),
+    N_Ictus_NA = sum(is.na(df$Ictus)),
+    N_No_Ictus = sum(df$Ictus == "No", na.rm = TRUE),
+    N_Si_Ictus = sum(df$Ictus == "Sí", na.rm = TRUE),
+    Porcentaje_Ictus = round(mean(df$Ictus == "Sí", na.rm = TRUE) * 100, 2),
+    Ratio_No_Si = round(
+      sum(df$Ictus == "No", na.rm = TRUE) / max(sum(df$Ictus == "Sí", na.rm = TRUE), 1),
+      2
+    )
+  )
+}
+
+balance_comparacion <- dplyr::bind_rows(
+  balance_resumen(stroke_base, "Base"),
+  balance_resumen(stroke_mod, "Limpio")
+)
+
+balance_fmt <- balance_comparacion %>%
+  dplyr::mutate(
+    Porcentaje_Ictus = paste0(Porcentaje_Ictus, " %")
+  ) %>%
+  dplyr::rename(
+    Total = N_Total,
+    `NA Ictus` = N_Ictus_NA,
+    `Ictus No` = N_No_Ictus,
+    `Ictus Sí` = N_Si_Ictus,
+    `% Ictus` = Porcentaje_Ictus,
+    `Ratio No/Sí` = Ratio_No_Si
+  )
+
+n_cols <- ncol(balance_fmt)
+
+balance_fmt %>%
+  knitr::kable(
+    format = "html",
+    escape = FALSE,
+    row.names = FALSE,
+    align = rep("c", ncol(balance_fmt))   
+  ) %>%
+  kableExtra::kable_styling(
+    bootstrap_options = c("striped", "hover", "bordered"),
+    full_width = FALSE,
+    position = "center",
+    font_size = 14
+  ) %>%
+  kableExtra::column_spec(1, bold = TRUE, width = "14em") %>%
+  kableExtra::column_spec(2:ncol(balance_fmt), width = "7em") %>%
+  kableExtra::row_spec(
+    0,
+    bold = TRUE,
+    color = "white",
+    background = "#2c3e50"
+  ) %>%
+  kableExtra::row_spec(
+    0:nrow(balance_fmt),
+    extra_css = "border: 1px solid black;"  
+  )
+```
+
+
+
+
+# 7. Dataset final para modelado.
+
+## 7.1. Tabla final de resumen descriptivo del dataset analítico.
+
+Se presenta una tabla final de resumen descriptivo del dataset analítico que sintetiza las características de las variables seleccionadas para el modelado.
+
+```{r resumen_final_dataset_analítico, echo=TRUE, warning=FALSE, message=FALSE}
+# Variables a incluir (solo las relevantes para el resumen final)
+vars_finales <- c(
+  "Ictus", "Género", "Edad", "Hipertensión", "Enfermedad cardiaca",
+  "Estado civil", "Tipo trabajo", "Tipo residencia", "Estado tabaquismo",
+  "IMC", "log_glucosa"
+)
+
+# Asegurar que Ictus está bien definido
+stroke_mod <- stroke_mod %>%
+  dplyr::mutate(Ictus = factor(Ictus, levels = c("No", "Sí")))
+
+# Funciones de resumen
+fmt_num <- function(x) {
+  x <- x[is.finite(x)]
+  if (length(x) == 0) return(NA_character_)
+  q <- stats::quantile(x, probs = c(0.25, 0.5, 0.75), na.rm = TRUE, names = FALSE)
+  rng <- range(x, na.rm = TRUE)
+  sprintf(
+    "Mediana %.1f [%.1f–%.1f]; rango [%.1f–%.1f]",
+    q[2], q[1], q[3], rng[1], rng[2]
+  )
+}
+
+fmt_cat <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) return(NA_character_)
+  tt <- sort(table(x), decreasing = TRUE)
+  top <- names(tt)[1]
+  pct <- 100 * as.numeric(tt[1]) / sum(tt)
+  sprintf("Moda: %s (%.1f%%) | %d niveles", top, pct, length(tt))
+}
+
+# Construir tabla solo con variables seleccionadas
+eda_tabla_final <- purrr::map_dfr(vars_finales, function(v) {
+  x <- stroke_mod[[v]]
+  
+  tipo <- dplyr::case_when(
+    is.numeric(x) ~ "Numérica",
+    is.factor(x) ~ "Categórica",
+    is.character(x) ~ "Categórica",
+    TRUE ~ class(x)[1]
+  )
+  
+  resumen <- if (v == "Ictus") {
+    prev <- mean(stroke_mod$Ictus == "Sí", na.rm = TRUE) * 100
+    sprintf("Prevalencia de ictus: %.2f%%", prev)
+  } else if (is.numeric(x)) {
+    fmt_num(x)
+  } else {
+    fmt_cat(x)
+  }
+  
+  tibble::tibble(
+    Variable = v,
+    Tipo = tipo,
+    `% valores perdidos` = sprintf(
+      "%d (%.1f%%)",
+      sum(is.na(x)),
+      100 * mean(is.na(x))
+    ),
+    Resumen = resumen
+  )
+})
+
+eda_tabla_final_fmt <- eda_tabla_final %>%
+  dplyr::mutate(
+    Variable = dplyr::recode(
+      Variable,
+      log_glucosa = "Log(glucosa)"
+    )
+  )
+
+n_cols <- ncol(eda_tabla_final_fmt)
+
+eda_tabla_final_fmt %>%
+  knitr::kable(
+    caption = "Tabla X: Resumen final del dataset analítico",
+    align = c("c", "c", "c", "c"),
+    format = "html",
+    escape = FALSE
+  ) %>%
+  kableExtra::add_header_above(
+    setNames(n_cols, "Resumen final del dataset analítico"),
+    bold = TRUE,
+    font_size = 16,
+    color = "white",
+    background = "#2c3e50"
+  ) %>%
+  kableExtra::kable_styling(
+    bootstrap_options = c("striped", "hover", "bordered"),
+    full_width = FALSE,
+    position = "center",
+    font_size = 13
+  ) %>%
+  kableExtra::row_spec(
+    0,
+    bold = TRUE,
+    color = "white",
+    background = "#2c3e50"
+  ) %>%
+  kableExtra::column_spec(1, bold = TRUE, width = "14em") %>%
+  kableExtra::column_spec(2:3, width = "6em") %>%
+  kableExtra::column_spec(4, width = "22em")
+```
+
+## 7.2. Verificación final de la estructura del dataset de modelado.
+
+Este chunk muestra **stroke_mod** en una tabla interactiva ya con el orden final de columnas. Se hace para verificar que la estructura definitiva del dataset sea clara y coherente antes de modelar.
+
+```{r verificación_estructura_dataset_modelado, echo=TRUE, warning=FALSE, message=FALSE}
+
+DT::datatable(
+  stroke_mod,
+  rownames = FALSE,
+  options = list(
+    pageLength = 10,
+    scrollX = TRUE,
+    autoWidth = TRUE,
+    dom = "Bfrtip",
+    buttons = c("copy", "csv", "excel", "pdf", "print")
+  ),
+  caption = "Vista interactiva del dataset final de modelado (stroke_mod)",
+  class = "display compact stripe hover"
+) %>%
+  DT::formatStyle(
+    columns = colnames(stroke_mod),
+    fontSize = "12px"
+  )
+```
+
+
+
+# 8. Preparación final del dataset para modelado
+
+## 8.1. Verificación del dataset de modelado
+
+En este bloque se valida el dataset final **stroke_mod**. Se hace una comprobación de la presencia de la variable objetivo (*Ictus*) y la ausencia de valores perdidos mediante **stopifnot** que detendría la ejecución del código en caso de error. Además se guarda el dataset en formato .rds para facilitar su reutilización sin tener que repetir el preprocesado. 
+
+```{r verificacion_dataset_modelado}
+
+# Verificaciones críticas (detienen el knit si algo falla)
+stopifnot(
+  exists("stroke_mod"),
+  "Ictus" %in% names(stroke_mod),
+  is.factor(stroke_mod$Ictus),
+  all(levels(stroke_mod$Ictus) %in% c("No", "Sí")),
+  all(c("Edad", "IMC", "log_glucosa") %in% names(stroke_mod)),
+  all(colSums(is.na(stroke_mod[, c("Edad", "IMC", "log_glucosa")])) == 0)
+)
+
+# Guardar dataset limpio
+saveRDS(stroke_mod, "stroke_mod_limpio.rds")
+
+# Comprobación silenciosa de variables derivadas
+invisible(
+  intersect(
+    c("log_glucosa", "IMC_outlier", "Glucosa_outlier", "IMC_implausible"),
+    names(stroke_mod)
+  )
+)
+```
+
+
+
+
+## 8.2. Particiones de validación cruzada externa
+
+
+Antes del entrenamiento de los modelos, se configura la paralelización mediante el **paquete *future*** con el fin de acelerar el proceso de cálculo. A continuación, la variable Ictus se recodifica como factor con niveles "No" y "Sí", garantizando un formato adecuado para los modelos de clasificación.
+
+A continuación, se recodifica *Ictus* como factor con niveles *"No"* y *"Sí"*, lo que garantiza un formato adecuado para los modelos de clasificación. 
+
+Asimismo, en este bloque se crean 10 particiones independientes mediante la validación cruzada Monte Carlo (80% de los datos para el entrenamiento y el 20% para test). El muestro se estratifica en base a la **variable Ictus** para que en todas las particiones se mantenga la misma proporción de casos con ictus (aproximadamente el 5%).
+
+La *semilla 123* garantiza la reproducibilidad de los resultados.
+
+```{r particiones_validacion_externa, echo=TRUE, warning=FALSE, message=FALSE}
+
+n_cores <- parallel::detectCores()
+n_workers <- max(1, n_cores - 2)
+future::plan(future::multisession, workers = n_workers)
+
+stroke_mod <- stroke_mod %>%
+  dplyr::mutate(Ictus = factor(Ictus, levels = c("No", "Sí")))
+
+set.seed(123)
+splits_outer <- rsample::mc_cv(
+  stroke_mod,
+  times = 10,
+  prop = 0.8,
+  strata = Ictus
+)
+```
+
+
+
+## 8.3. Recetas de preprocesamiento y balanceo
+
+En este bloque se crea la función **make_recipe()** encargada de construir la receta de preprocesamiento que se aplicará a los datos de entrenamiento antes de ajustar los modelos.
+
+Estas transformaciones consisten en eliminar variables redundantes (versiones categóricas de edad e IMC, o la glucosa sin transformar), imputar valores perdidos y aplicar diferentes técnicas de balanceo.
+
+Ante el fuerte desequilibrio de clases (solo un 5% de casos con ictus), se evalúan cuatro estrategias: **upsample** (sobremuestreo aleatorio), **downsample** (submuestreo aleatorio), **SMOTE** (generación sintética de casos) y **none** (sin balanceo). De esta forma, cada modelo puede entrenarse con la estrategia que mejor se adapte a sus características.
+
+
+```{r modelado_recetas_balanceo, echo=TRUE, warning=FALSE, message=FALSE}
+
+
+make_recipe <- function(train_data,
+                        balance = c("none", "smote", "upsample", "downsample"),
+                        seed = 123) {
+
+  balance <- match.arg(balance)
+
+  vars_modelo <- c(
+    "Ictus",
+    "Edad",
+    "IMC",
+    "log_glucosa",
+    "Género",
+    "Hipertensión",
+    "Enfermedad cardiaca",
+    "Estado civil",
+    "Tipo trabajo",
+    "Tipo residencia",
+    "Estado tabaquismo"
+  )
+
+  rec_base <- recipes::recipe(
+    Ictus ~ .,
+    data = train_data %>%
+      dplyr::select(dplyr::all_of(vars_modelo))
+  ) %>%
+    recipes::step_impute_median(recipes::all_numeric_predictors()) %>%
+    recipes::step_impute_mode(recipes::all_nominal_predictors()) %>%
+    recipes::step_novel(recipes::all_nominal_predictors()) %>%
+    recipes::step_other(recipes::all_nominal_predictors(), threshold = 0.02)
+
+  rec <- switch(
+    balance,
+
+    none = rec_base %>%
+      recipes::step_dummy(recipes::all_nominal_predictors()) %>%
+      recipes::step_zv(recipes::all_predictors()) %>%
+      recipes::step_nzv(recipes::all_predictors()) %>%
+      recipes::step_normalize(recipes::all_numeric_predictors()),
+
+    upsample = rec_base %>%
+      themis::step_upsample(Ictus, over_ratio = 1, seed = seed) %>%
+      recipes::step_dummy(recipes::all_nominal_predictors()) %>%
+      recipes::step_zv(recipes::all_predictors()) %>%
+      recipes::step_nzv(recipes::all_predictors()) %>%
+      recipes::step_normalize(recipes::all_numeric_predictors()),
+
+    downsample = rec_base %>%
+      themis::step_downsample(Ictus, under_ratio = 1, seed = seed) %>%
+      recipes::step_dummy(recipes::all_nominal_predictors()) %>%
+      recipes::step_zv(recipes::all_predictors()) %>%
+      recipes::step_nzv(recipes::all_predictors()) %>%
+      recipes::step_normalize(recipes::all_numeric_predictors()),
+
+    smote = rec_base %>%
+      recipes::step_dummy(recipes::all_nominal_predictors()) %>%
+      recipes::step_zv(recipes::all_predictors()) %>%
+      recipes::step_nzv(recipes::all_predictors()) %>%
+      recipes::step_normalize(recipes::all_numeric_predictors()) %>%
+      themis::step_smote(Ictus, seed = seed)
+  )
+
+  rec
+}
+
+estrategias_balanceo <- c("none", "smote", "upsample", "downsample")
+```
+
+
+# 9. Desarrollo y evaluación de modelos predictivos
+
+## 9.1. Especificación de modelos y grids de ajuste
+
+
+En este bloque se especifican los tres algoritmos de clasificación que se evaluarán: **regresión logística penalizada**, **árbol de decisión** y **Random Forest**. Para cada uno de ellos se especifica su motor de ajuste y los hiperparámetros que serán optimizados durante el proceso de validación.
+
+Finalmente, todos los modelos se almacenan en una lista estructurada con su etiqueta, especificación, necesidad de ajuste y grid asociado, para ser utilizados posteriormente en la validación cruzada.
+
+```{r modelado_modelos_grids, echo=TRUE, warning=FALSE, message=FALSE}
+
+spec_logistica <- parsnip::logistic_reg(
+  penalty = tune::tune(),
+  mixture = 0
+) %>%
+  parsnip::set_engine("glmnet") %>%
+  parsnip::set_mode("classification")
+
+grid_logistica <- tibble::tibble(
+  penalty = 10 ^ seq(-4, 0, length.out = 15)
+)
+
+spec_arbol <- parsnip::decision_tree(
+  cost_complexity = tune::tune(),
+  tree_depth      = tune::tune(),
+  min_n           = tune::tune()
+) %>%
+  parsnip::set_engine("rpart") %>%
+  parsnip::set_mode("classification")
+
+grid_arbol <- dials::grid_latin_hypercube(
+  dials::cost_complexity(range = c(-5, -1)),
+  dials::tree_depth(range = c(2L, 12L)),
+  dials::min_n(range = c(2L, 40L)),
+  size = 12
+)
+
+spec_rf <- parsnip::rand_forest(
+  trees = 500,
+  mtry  = tune::tune(),
+  min_n = tune::tune()
+) %>%
+  parsnip::set_engine("ranger", probability = TRUE, class_prob = TRUE, importance = "impurity", seed = 123) %>%
+  parsnip::set_mode("classification")
+
+grid_rf <- dials::grid_latin_hypercube(
+  dials::mtry(range = c(1L, 15L)),
+  dials::min_n(range = c(2L, 40L)),
+  size = 12
+)
+
+modelos <- list(
+  logit = list(label = "Logística", spec = spec_logistica, tune = TRUE, grid = grid_logistica),
+  tree  = list(label = "Árbol", spec = spec_arbol, tune = TRUE, grid = grid_arbol),
+  rf    = list(label = "Random Forest", spec = spec_rf, tune = TRUE, grid = grid_rf)
+)
+```
+
+
+## 9.2. Funciones auxiliares del flujo de modelado
+
+En este bloque se definen tres funciones clave para el proceso de validación y evaluación de los modelos.
+
+- **oof_from_resamples()**: obtiene predicciones out-of-fold durante la validación cruzada interna.
+
+- **threshold_f1()**: calcula el umbral óptimo de clasificación maximizando la medida F1 a partir de las probabilidades predichas
+
+- **metrics_from_prob_thr()**: evalúa el modelo con múltiples métricas a partir de las probabilidades y el umbral de Youden.
+  
+Estas funciones se utilizan durante la validación cruzada anidada para evaluar de forma consistente todos los modelos y estrategias de balanceo.
+```{r modelado_helpers, echo=TRUE, warning=FALSE, message=FALSE}
+
+oof_from_resamples <- function(wf_final, inner_rs) {
+  purrr::map_dfr(inner_rs$splits, function(s) {
+    train_df <- rsample::analysis(s)
+    test_df  <- rsample::assessment(s)
+
+    fit <- parsnip::fit(wf_final, data = train_df)
+    probs <- predict(fit, new_data = test_df, type = "prob")
+
+    # Detectar automáticamente la columna de probabilidad de la clase positiva
+    clase_pos <- "Sí"
+    posibles_nombres <- c(
+      paste0(".pred_", clase_pos),
+      paste0(".pred_", make.names(clase_pos))
+    )
+    col_prob_si <- intersect(posibles_nombres, names(probs))[1]
+
+    if (is.na(col_prob_si)) {
+      stop("No se encontró la columna de probabilidad para la clase positiva ('Sí').")
+    }
+
+    tibble::tibble(
+      truth   = factor(test_df$Ictus, levels = c("No", "Sí")),
+      prob_si = probs[[col_prob_si]]
+    )
+  })
+}
+
+threshold_f1 <- function(truth, prob) {
+  truth <- factor(truth, levels = c("No", "Sí"))
+
+  thr_vals <- sort(unique(prob))
+
+  f1_vals <- purrr::map_dbl(thr_vals, function(t) {
+    pred <- factor(ifelse(prob >= t, "Sí", "No"), levels = c("No", "Sí"))
+    yardstick::f_meas_vec(truth, pred, event_level = "second")
+  })
+
+  thr_vals[which.max(f1_vals)]
+}
+
+metrics_from_prob_thr <- function(truth, prob, thr) {
+  truth <- factor(truth, levels = c("No", "Sí"))
+
+  metricas_base <- tibble::tibble(
+    roc_auc = yardstick::roc_auc_vec(truth, prob, event_level = "second"),
+    pr_auc  = yardstick::pr_auc_vec(truth, prob, event_level = "second")
+  )
+
+  if (is.na(thr)) {
+    return(dplyr::bind_cols(
+      metricas_base,
+      tibble::tibble(
+        sens = NA_real_,
+        spec = NA_real_,
+        accuracy = NA_real_,
+        f1 = NA_real_,
+        ppv = NA_real_,
+        npv = NA_real_,
+        bal_acc = NA_real_,
+        pred_si_rate = NA_real_
+      )
+    ))
+  }
+
+  pred <- factor(ifelse(prob >= thr, "Sí", "No"), levels = c("No", "Sí"))
+
+  dplyr::bind_cols(
+    metricas_base,
+    tibble::tibble(
+      sens = yardstick::sens_vec(truth, pred, event_level = "second"),
+      spec = yardstick::spec_vec(truth, pred, event_level = "second"),
+      accuracy = yardstick::accuracy_vec(truth, pred),
+      f1 = yardstick::f_meas_vec(truth, pred, event_level = "second"),
+      ppv = yardstick::ppv_vec(truth, pred, event_level = "second"),
+      npv = yardstick::npv_vec(truth, pred, event_level = "second"),
+      bal_acc = yardstick::bal_accuracy_vec(truth, pred, event_level = "second"),
+      pred_si_rate = mean(pred == "Sí", na.rm = TRUE)
+    )
+  )
+}
+```
+
+
+## 9.3. Evaluación de una partición externa
+
+La función **eval_one_outer()** evalúa cada modelo en una de las particiones del proceso de validación. Primero entrena el modelo, con diferentes configuraciones para finalmente elegir la mejor, y después calcula el umbral de clasificación más adecuado a partir de las predicciones.
+
+Por último, se entrena el modelo con los datos de entrenamiento y se evalúa sobre el conjunto de validación. Se obtienen métricas de rendimiento, umbral elegido y probabilidades predichas.
+
+```{r evaluacion_un_split_externo, echo=TRUE, warning=FALSE, message=FALSE}
+eval_one_outer <- function(split_obj,
+                           model_name,
+                           balance,
+                           modelos,
+                           make_recipe,
+                           inner_v = 3,
+                           seed = 123) {
+
+  if (!inherits(split_obj, "rsplit")) {
+    stop(
+      "split_obj no es un objeto rsplit. Clase recibida: ",
+      paste(class(split_obj), collapse = ", ")
+    )
+  }
+
+  set.seed(seed)
+
+  train_df <- rsample::analysis(split_obj) %>%
+    dplyr::mutate(Ictus = factor(Ictus, levels = c("No", "Sí")))
+
+  test_df <- rsample::assessment(split_obj) %>%
+    dplyr::mutate(Ictus = factor(Ictus, levels = c("No", "Sí")))
+
+  rec <- make_recipe(train_df, balance = balance, seed = seed)
+
+  cfg <- modelos[[model_name]]
+
+  wf <- workflows::workflow() %>%
+    workflows::add_recipe(rec) %>%
+    workflows::add_model(cfg$spec)
+
+  inner_rs <- rsample::vfold_cv(train_df, v = inner_v, strata = Ictus)
+
+  if (isTRUE(cfg$tune)) {
+    tune_res <- tune::tune_grid(
+      wf,
+      resamples = inner_rs,
+      grid = cfg$grid,
+      metrics = yardstick::metric_set(yardstick::roc_auc, yardstick::pr_auc),
+      control = tune::control_grid(save_pred = FALSE)
+    )
+
+    best <- tune::select_best(tune_res, metric = "pr_auc")
+    wf_final <- tune::finalize_workflow(wf, best)
+  } else {
+    wf_final <- wf
+  }
+
+  oof <- oof_from_resamples(wf_final, inner_rs)
+  thr <- threshold_f1(oof$truth, oof$prob_si)
+
+  fit_final <- parsnip::fit(wf_final, data = train_df)
+  test_prob_raw <- predict(fit_final, new_data = test_df, type = "prob")
+
+  posibles_nombres <- c(".pred_Sí", ".pred_Sí")
+  col_prob_si <- intersect(posibles_nombres, names(test_prob_raw))[1]
+
+  if (is.na(col_prob_si)) {
+    stop("No se encontró la columna de probabilidad de la clase positiva.")
+  }
+
+  test_prob <- test_prob_raw[[col_prob_si]]
+
+  met <- metrics_from_prob_thr(test_df$Ictus, test_prob, thr)
+
+  tibble::tibble(
+    model = model_name,
+    balance = balance,
+    threshold = thr
+  ) %>%
+    dplyr::bind_cols(met) %>%
+    dplyr::mutate(
+      preds = list(
+        tibble::tibble(
+          Ictus = test_df$Ictus,
+          .pred_Sí = test_prob
+        )
+      )
+    )
+}
+```
+
+
+
+## 9.4. Ejecución completa de la validación externa
+
+En este bloque se ejecuta la validación completa de los modelos. Se evalúan un total de 120 combinaciones posibles entre particiones, algoritmos y estrategias de balanceo. Para cada caso se utiliza la función **eval_one_outer()** con una semilla específica. Los resultados se almacenan en **resultados_cv_raw** para su posterior análisis. 
+
+```{r modelado_outer_cv_completo, echo=TRUE, warning=TRUE, message=TRUE}
+
+n_reps_outer <- nrow(splits_outer)
+n_models     <- length(modelos)
+n_balances   <- length(estrategias_balanceo)
+
+progressr::with_progress({
+  p <- progressr::progressor(steps = n_reps_outer * n_models * n_balances)
+
+  resultados_cv_raw <- purrr::map_dfr(seq_len(n_reps_outer), function(i) {
+
+    split_i <- splits_outer$splits[[i]]
+
+    purrr::map_dfr(names(modelos), function(model_key) {
+      purrr::map_dfr(estrategias_balanceo, function(balance_key) {
+
+        seed_combo <- 100000 + i * 100 +
+          match(model_key, names(modelos)) * 10 +
+          match(balance_key, estrategias_balanceo)
+
+        p(sprintf(
+          "Outer %d/%d | %s | %s",
+          i, n_reps_outer, model_key, balance_key
+        ))
+
+        eval_one_outer(
+          split_obj   = split_i,
+          model_name  = model_key,
+          balance     = balance_key,
+          modelos     = modelos,
+          make_recipe = make_recipe,
+          inner_v     = 3,
+          seed        = seed_combo
+        )
+      })
+    }) %>%
+      dplyr::mutate(rep = i)
+
+  })
+
+}, handlers = list(progressr::handler_txtprogressbar()))
+```
+
+
+## 9.5. Resultados agregados y predicciones externas
+
+En este punto se organizan los resultados obtenidos en la validación externa para su posterior análisis. 
+
+Se crea el obtejo **resultados_validacion**, que recoge las métricas de rendimiento de cada combinación de modelo, estrategia de balanceo y repetición, además de renombrar los modelos y guardar el umbral utilizado.
+
+También se genera **predicciones_todos_modelos**, que contiene las predicciones individuales de cada observación en cada evaluación. 
+
+Ambos objetos son la base para comparar el rendimiento de los modelos y seleccionar el "mejor modelo".
+
+```{r modelado_resultados_outer, echo=TRUE, warning=FALSE, message=FALSE}
+
+
+resultados_validacion <- resultados_cv_raw %>%
+  dplyr::mutate(
+    modelo = dplyr::recode(model,
+      logit = "Logística",
+      tree  = "Árbol",
+      rf    = "Random Forest"
+    ),
+    umbral = threshold
+  ) %>%
+  dplyr::select(-threshold) %>%
+  dplyr::select(-preds) %>%
+  dplyr::mutate(dplyr::across(where(is.numeric), ~ round(.x, 4))) %>%
+  dplyr::arrange(modelo, balance, rep)
+
+predicciones_test <- resultados_cv_raw %>%
+  dplyr::transmute(
+    modelo = dplyr::recode(model,
+      logit = "Logística",
+      tree  = "Árbol",
+      rf    = "Random Forest"
+    ),
+    balance,
+    rep,
+    preds
+  ) %>%
+  tidyr::unnest(preds)
+
+predicciones_todos_modelos <- predicciones_test
+
+resultados_validacion
+```
+
+
+## 9.6. Resumen de métricas por combinación
+
+En este bloque se reusmen los resultados de la validación cruzada agrupándolos por modelo y estrategia de balanceo. Para cada combinación se calcula la media y desviación estándar de las principales métricas de rendimiento (ROC AUC, PR AUC, sensibilidad, especificidad, F1, *balanced accuaracy* o el umbral medio empleado).
+
+Con esta información se crea el data frame **resumen_metricas**, que permite la comparación de cada combinación. 
+ 
+
+```{r resumen_metricas_modelos, echo=TRUE, warning=FALSE, message=FALSE}
+
+
+resumen_metricas <- resultados_validacion %>%
+  dplyr::group_by(modelo, balance) %>%
+  dplyr::summarise(
+    n = dplyr::n(),
+    roc_auc_mean = mean(roc_auc, na.rm = TRUE),
+    roc_auc_sd   = sd(roc_auc, na.rm = TRUE),
+    pr_auc_mean  = mean(pr_auc, na.rm = TRUE),
+    pr_auc_sd    = sd(pr_auc, na.rm = TRUE),
+    sensitivity_mean = mean(sens, na.rm = TRUE),
+    sensitivity_sd   = sd(sens, na.rm = TRUE),
+    specificity_mean = mean(spec, na.rm = TRUE),
+    specificity_sd   = sd(spec, na.rm = TRUE),
+    accuracy_mean    = mean(accuracy, na.rm = TRUE),
+    accuracy_sd      = sd(accuracy, na.rm = TRUE),
+    f1_mean          = mean(f1, na.rm = TRUE),
+    f1_sd            = sd(f1, na.rm = TRUE),
+    ppv_mean         = mean(ppv, na.rm = TRUE),
+    ppv_sd           = sd(ppv, na.rm = TRUE),
+    npv_mean         = mean(npv, na.rm = TRUE),
+    npv_sd           = sd(npv, na.rm = TRUE),
+    bal_accuracy_mean = mean(bal_acc, na.rm = TRUE),
+    bal_accuracy_sd   = sd(bal_acc, na.rm = TRUE),
+    pred_si_rate_mean = mean(pred_si_rate, na.rm = TRUE),
+    pred_si_rate_sd   = sd(pred_si_rate, na.rm = TRUE),
+    umbral_mean       = mean(umbral, na.rm = TRUE),
+    umbral_sd         = sd(umbral, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(dplyr::across(where(is.numeric), ~ round(.x, 4)))
+
+
+
+tabla_modelos_fmt <- resumen_metricas %>%
+  dplyr::transmute(
+    Modelo = modelo,
+    Balanceo = balance,
+    `ROC AUC` = sprintf("%.3f ± %.3f", roc_auc_mean, roc_auc_sd),
+    `PR AUC` = sprintf("%.3f ± %.3f", pr_auc_mean, pr_auc_sd),
+    Sensibilidad = sprintf("%.3f ± %.3f", sensitivity_mean, sensitivity_sd),
+    Especificidad = sprintf("%.3f ± %.3f", specificity_mean, specificity_sd),
+    `F1-score` = sprintf("%.3f ± %.3f", f1_mean, f1_sd),
+    `Balanced Accuracy` = sprintf("%.3f ± %.3f", bal_accuracy_mean, bal_accuracy_sd)
+  )
+
+n_cols <- ncol(tabla_modelos_fmt)
+
+# 📊 Tabla estilo informe (tu mismo formato)
+tabla_modelos_fmt %>%
+  knitr::kable(
+    align = rep("c", n_cols),
+    format = "html",
+    escape = FALSE
+  ) %>%
+  kableExtra::kable_styling(
+    bootstrap_options = c("striped", "hover", "bordered"),
+    full_width = FALSE,
+    position = "center",
+    font_size = 11
+  ) %>%
+  kableExtra::row_spec(
+    0,
+    bold = TRUE,
+    color = "white",
+    background = "#2c3e50"
+  ) %>%
+  kableExtra::column_spec(1, bold = TRUE, width = "12em") %>%   
+  kableExtra::column_spec(2, width = "10em") %>%               
+  kableExtra::column_spec(3:7, width = "8em") %>%               
+  kableExtra::column_spec(8, width = "12em") %>%          
+  kableExtra::row_spec(
+    0:nrow(tabla_modelos_fmt),
+    extra_css = "border: 1px solid black;"
+  )
+```
+
+
+## 9.7. Preparación de datos para visualización
+
+A continuación, se transforma el objeto **resumen_metricas** a formato largo (**resumen_metricas_long**), separando las medias y las desviaciones estándar en columnas distintas para cada métrica. Esta transformación permite organizar los resultados de forma más adecuada para su representación gráfica y comparación entre modelos.
+
+
+```{r preparar_graficas_metricas, echo=TRUE, warning=FALSE, message=FALSE}
+
+
+metric_labels <- c(
+  roc_auc = "ROC AUC",
+  pr_auc = "PR AUC",
+  sensitivity = "Sensibilidad",
+  specificity = "Especificidad",
+  accuracy = "Exactitud",
+  f1 = "F1",
+  ppv = "VPP",
+  npv = "VPN",
+  bal_accuracy = "Balanced Accuracy",
+  pred_si_rate = "Tasa predicha Si",
+  umbral = "Umbral Youden"
+)
+
+resumen_metricas_long <- resumen_metricas %>%
+  tidyr::pivot_longer(
+    cols = -c(modelo, balance, n),
+    names_to = c("metrica", "stat"),
+    names_pattern = "^(.*)_(mean|sd)$",
+    values_to = "valor"
+  ) %>%
+  tidyr::pivot_wider(
+    names_from = stat,
+    values_from = valor
+  ) %>%
+  dplyr::mutate(
+    metrica_lbl = dplyr::recode(metrica, !!!metric_labels)
+  )
+
+```
+
+
+
+## 9.8. Visualización comparativa del rendimiento
+
+En este apartado se generan tres gráficos para comparar el rendimiento de los modelos: un **heatmap** con las métricas principales, un gráfico de **trade-off entre sensibilidad y especificidad**, y la evolución del **umbral óptimo de clasificación** por modelo y balanceo. Estas representaciones permiten comparar de forma visual el comportamiento de los modelos y facilitar la identificación de las combinaciones más adecuadas.
+
+```{r visualizacion_resultados_modelos, echo=TRUE, warning=FALSE, message=FALSE}
+
+metricas_principales <- c("pr_auc", "roc_auc", "f1", "bal_accuracy", "sensitivity", "specificity")
+
+df_metricas_principales <- resumen_metricas_long %>%
+  dplyr::filter(metrica %in% metricas_principales)
+
+df_metricas_principales_fmt <- df_metricas_principales %>%
+  dplyr::mutate(
+    balance = dplyr::recode(
+      balance,
+      none = "None",
+      smote = "SMOTE",
+      downsample = "Down",
+      upsample = "Up"
+    ),
+    modelo = dplyr::recode(
+      modelo,
+      "Random Forest" = "RF",
+      "Logística" = "Log",
+      "Árbol" = "Árbol"
+    ),
+    balance = factor(balance, levels = c("None", "SMOTE", "Down", "Up")),
+    modelo = factor(modelo, levels = c("Log", "Árbol", "RF"))
+  )
+
+p_heat <- ggplot2::ggplot(
+  df_metricas_principales_fmt,
+  ggplot2::aes(x = balance, y = modelo, fill = mean)
+) +
+  ggplot2::geom_tile(color = "white", linewidth = 0.4) +
+  ggplot2::scale_fill_gradient2(
+    low = "white",
+    mid = "grey",
+    high = "darkcyan",
+    midpoint = 0.5,
+    name = "Media"
+  ) +
+  ggplot2::geom_text(
+    ggplot2::aes(label = round(mean, 2)),
+    size = 3
+  ) +
+  ggplot2::facet_wrap(~ metrica_lbl, scales = "free") +
+  ggplot2::labs(
+    title = "Resumen de rendimiento por modelo y estrategia de balanceo",
+    subtitle = "Comparación de métricas principales (media en validación cruzada)",
+    x = "Estrategia de balanceo",
+    y = "Modelo"
+  ) +
+  ggplot2::theme_minimal(base_size = 13) +
+  ggplot2::theme(
+    plot.title = ggplot2::element_text(face = "bold", size = 15),
+    plot.subtitle = ggplot2::element_text(size = 12, margin = ggplot2::margin(b = 10)),
+    axis.title = ggplot2::element_text(face = "bold"),
+    axis.text.x = ggplot2::element_text(angle = 30, hjust = 1),
+    legend.position = "bottom",
+    strip.text = ggplot2::element_text(face = "bold"),
+    panel.grid = ggplot2::element_blank()
+  )
+
+print(p_heat)
+
+df_tradeoff <- resumen_metricas_long %>%
+  dplyr::filter(metrica %in% c("sensitivity", "specificity")) %>%
+  tidyr::pivot_wider(
+    id_cols = c(modelo, balance),
+    names_from = metrica,
+    values_from = mean
+  )
+
+p_trade <- ggplot2::ggplot(
+  df_tradeoff,
+  ggplot2::aes(x = specificity, y = sensitivity, color = balance, shape = modelo)
+) +
+  ggplot2::geom_point(size = 3) +
+  ggplot2::theme_minimal() +
+  ggplot2::labs(
+    title = "Trade-off entre sensibilidad y especificidad",
+    x = "Especificidad",
+    y = "Sensibilidad",
+    color = "Balanceo",
+    shape = "Modelo"
+  )
+
+print(p_trade)
+
+df_umbral <- resumen_metricas_long %>%
+  dplyr::filter(metrica == "umbral") %>%
+  dplyr::mutate(
+    balance = factor(
+      balance,
+      levels = c("none", "smote", "downsample", "upsample"),
+      labels = c("None", "SMOTE", "Down", "Up")
+    )
+  )
+
+p_umbral <- ggplot2::ggplot(
+  df_umbral,
+  ggplot2::aes(x = balance, y = mean, color = modelo, group = modelo)
+) +
+  ggplot2::geom_line(linewidth = 1) +
+  ggplot2::geom_point(size = 3) +
+  ggplot2::geom_errorbar(
+    ggplot2::aes(ymin = mean - sd, ymax = mean + sd),
+    width = 0.12,
+    linewidth = 0.6
+  ) +
+  ggplot2::labs(
+    title = "Umbral óptimo por modelo y estrategia de balanceo",
+    subtitle = "Media ± desviación estándar en validación cruzada",
+    x = "Estrategia de balanceo",
+    y = "Umbral óptimo"
+  ) +
+  ggplot2::theme_minimal(base_size = 13) +
+  ggplot2::theme(
+    plot.title = ggplot2::element_text(face = "bold", size = 15),
+    plot.subtitle = ggplot2::element_text(size = 12, margin = ggplot2::margin(b = 10)),
+    axis.title = ggplot2::element_text(face = "bold"),
+    axis.text.x = ggplot2::element_text(angle = 0, vjust = 0.5),
+    legend.position = "top",
+    legend.title = ggplot2::element_blank(),
+    panel.grid.minor = ggplot2::element_blank()
+  )
+
+print(p_umbral)
+```
+
+
+## 9.9. Intervalos de confianza empíricos
+
+Este bloque calcula intervalos de confianza empíricos al 95% para las principales métricas de rendimiento (ROC AUC, PR AUC, F1, sensibilidad, especificidad, *accuary*, PPV, NPV y *balanced accuary*). Estos intervalos permiten evaluar la estabilidad y la fiabilidad de los resultados obtenidos, proporcionando una medida adicional de la variabilidad del rendimiento de los modelos.
+
+```{r tabla_intervalos_confianza, echo=TRUE, warning=FALSE, message=FALSE}
+tabla_intervalos_confianza <- resultados_validacion %>%
+  dplyr::group_by(modelo, balance) %>%
+  dplyr::summarise(
+    roc_auc_ic_low  = stats::quantile(roc_auc, 0.025, na.rm = TRUE),
+    roc_auc_ic_high = stats::quantile(roc_auc, 0.975, na.rm = TRUE),
+
+    pr_auc_ic_low   = stats::quantile(pr_auc, 0.025, na.rm = TRUE),
+    pr_auc_ic_high  = stats::quantile(pr_auc, 0.975, na.rm = TRUE),
+
+    f1_ic_low       = stats::quantile(f1, 0.025, na.rm = TRUE),
+    f1_ic_high      = stats::quantile(f1, 0.975, na.rm = TRUE),
+
+    sensitivity_ic_low  = stats::quantile(sens, 0.025, na.rm = TRUE),
+    sensitivity_ic_high = stats::quantile(sens, 0.975, na.rm = TRUE),
+
+    specificity_ic_low  = stats::quantile(spec, 0.025, na.rm = TRUE),
+    specificity_ic_high = stats::quantile(spec, 0.975, na.rm = TRUE),
+
+    accuracy_ic_low  = stats::quantile(accuracy, 0.025, na.rm = TRUE),
+    accuracy_ic_high = stats::quantile(accuracy, 0.975, na.rm = TRUE),
+
+    ppv_ic_low  = stats::quantile(ppv, 0.025, na.rm = TRUE),
+    ppv_ic_high = stats::quantile(ppv, 0.975, na.rm = TRUE),
+
+    npv_ic_low  = stats::quantile(npv, 0.025, na.rm = TRUE),
+    npv_ic_high = stats::quantile(npv, 0.975, na.rm = TRUE),
+
+    bal_accuracy_ic_low  = stats::quantile(bal_acc, 0.025, na.rm = TRUE),
+    bal_accuracy_ic_high = stats::quantile(bal_acc, 0.975, na.rm = TRUE),
+
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(dplyr::across(where(is.numeric), ~ round(.x, 4)))
+
+tabla_ic_fmt <- tabla_intervalos_confianza %>%
+  dplyr::mutate(
+    modelo = dplyr::recode(
+      modelo,
+      "Random Forest" = "RF",
+      "Logística" = "Logística",
+      "Árbol" = "Árbol"
+    ),
+    balance = dplyr::recode(
+      balance,
+      none = "None",
+      smote = "SMOTE",
+      downsample = "Downsample",
+      upsample = "Upsample"
+    ),
+
+    `ROC AUC` = sprintf("%.3f – %.3f", roc_auc_ic_low, roc_auc_ic_high),
+    `PR AUC` = sprintf("%.3f – %.3f", pr_auc_ic_low, pr_auc_ic_high),
+    `F1-score` = sprintf("%.3f – %.3f", f1_ic_low, f1_ic_high),
+    `Sensibilidad` = sprintf("%.3f – %.3f", sensitivity_ic_low, sensitivity_ic_high),
+    `Especificidad` = sprintf("%.3f – %.3f", specificity_ic_low, specificity_ic_high),
+    `Accuracy` = sprintf("%.3f – %.3f", accuracy_ic_low, accuracy_ic_high),
+    `PPV` = sprintf("%.3f – %.3f", ppv_ic_low, ppv_ic_high),
+    `NPV` = sprintf("%.3f – %.3f", npv_ic_low, npv_ic_high),
+    `Balanced Accuracy` = sprintf("%.3f – %.3f", bal_accuracy_ic_low, bal_accuracy_ic_high)
+  ) %>%
+  dplyr::rename(
+    Modelo = modelo,
+    Balance = balance
+  ) %>%
+  dplyr::select(
+    Modelo, Balance,
+    `ROC AUC`,
+    `PR AUC`,
+    `F1-score`,
+    `Sensibilidad`,
+    `Especificidad`,
+    `Accuracy`,
+    `PPV`,
+    `NPV`,
+    `Balanced Accuracy`
+  ) %>%
+  dplyr::arrange(Modelo, Balance)
+
+n_cols <- ncol(tabla_ic_fmt)
+
+tabla_ic_fmt %>%
+  knitr::kable(
+    align = rep("c", n_cols),
+    format = "html",
+    escape = FALSE
+  ) %>%
+  
+  kableExtra::kable_styling(
+    bootstrap_options = c("striped", "hover", "bordered"),
+    full_width = FALSE,
+    position = "center",
+    font_size = 10
+  ) %>%
+  kableExtra::row_spec(
+    0,
+    bold = TRUE,
+    color = "white",
+    background = "#2c3e50"
+  ) %>%
+  kableExtra::column_spec(1, bold = TRUE, width = "3em") %>%
+  kableExtra::column_spec(2, width = "3em") %>%
+  kableExtra::column_spec(3:5, width = "12em") %>%
+  kableExtra::column_spec(6:7, width = "6em") %>%
+  kableExtra::column_spec(8, width = "10em") %>%
+  kableExtra::column_spec(9:10, width = "12em") %>%
+  kableExtra::column_spec(11, width = "9em")
+```
+
+# 10. Selección, entrenamiento y calibración del modelo final
+
+## 10.1. Selección del modelo final
+
+
+En este bloque se produce la selección del modelo final combinando rendimiento y estabilidad. Para ello, primero se aplican filtros que permiten descartar combinaciones poco robustas, y después se calcula una puntuación global que prioriza PR AUC, F1, especificidad y baja variabilidad. La combinación con mejor puntuación es la elegida como modelo final. 
+
+```{r seleccion_modelo_final, echo=TRUE, warning=FALSE, message=FALSE}
+
+# Unir medias/SD con IC 95%
+seleccion_modelos <- resumen_metricas %>%
+  dplyr::left_join(
+    tabla_intervalos_confianza,
+    by = c("modelo", "balance")
+  ) %>%
+  dplyr::mutate(
+    # Anchura de los IC de las métricas principales
+    pr_auc_ic_width = pr_auc_ic_high - pr_auc_ic_low,
+    f1_ic_width     = f1_ic_high - f1_ic_low,
+
+    # Variabilidad total de las métricas principales
+    variabilidad_total = pr_auc_sd + f1_sd
+  )
+
+# -------- 1. FILTROS DUROS DE ROBUSTEZ --------
+# Se excluyen modelos claramente inestables o clínicamente poco fiables
+seleccion_filtrada <- seleccion_modelos %>%
+  dplyr::filter(
+    # Evitar modelos que en algunos folds prácticamente no detectan positivos
+    sensitivity_ic_low > 0.05,
+
+    # Evitar IC excesivamente amplios en las métricas principales
+    pr_auc_ic_width < 0.20,
+    f1_ic_width < 0.20
+  )
+
+# Si los filtros son demasiado restrictivos y eliminan todo,
+# se vuelve a la tabla original para no romper el flujo
+if (nrow(seleccion_filtrada) == 0) {
+  seleccion_filtrada <- seleccion_modelos
+}
+
+# -------- 2. FILTRO POR RENDIMIENTO EN PR AUC --------
+# Se conservan modelos cuyo límite superior del IC95% de PR AUC
+# no quede claramente por debajo del mejor PR AUC medio observado
+umbral_pr_auc <- 0.95 * max(seleccion_filtrada$pr_auc_mean, na.rm = TRUE)
+
+seleccion_filtrada <- seleccion_filtrada %>%
+  dplyr::filter(pr_auc_ic_high >= umbral_pr_auc)
+
+if (nrow(seleccion_filtrada) == 0) {
+  seleccion_filtrada <- seleccion_modelos
+}
+
+# -------- 3. NORMALIZACIÓN --------
+min_max_norm <- function(x) {
+  rng <- range(x, na.rm = TRUE)
+  if (isTRUE(all.equal(rng[1], rng[2]))) {
+    rep(1, length(x))
+  } else {
+    (x - rng[1]) / (rng[2] - rng[1])
+  }
+}
+
+seleccion_filtrada <- seleccion_filtrada %>%
+  dplyr::mutate(
+    # Mayor es mejor
+    pr_auc_norm = min_max_norm(pr_auc_mean),
+    f1_norm     = min_max_norm(f1_mean),
+    spec_norm   = min_max_norm(specificity_mean),
+
+    # Menor es mejor
+    var_norm    = 1 - min_max_norm(variabilidad_total),
+    pr_ic_norm  = 1 - min_max_norm(pr_auc_ic_width),
+    f1_ic_norm  = 1 - min_max_norm(f1_ic_width)
+  )
+
+# -------- 4. SCORE COMPUESTO --------
+# Prioridad:
+# - PR AUC: 40%
+# - F1: 30%
+# - Especificidad: 10%
+# - Baja variabilidad: 10%
+# - IC estrechos: 10% (5% PR AUC + 5% F1)
+seleccion_filtrada <- seleccion_filtrada %>%
+  dplyr::mutate(
+    score_final = (0.40 * pr_auc_norm) +
+                  (0.30 * f1_norm) +
+                  (0.10 * spec_norm) +
+                  (0.10 * var_norm) +
+                  (0.05 * pr_ic_norm) +
+                  (0.05 * f1_ic_norm)
+  ) %>%
+  dplyr::arrange(
+    dplyr::desc(score_final),
+    dplyr::desc(pr_auc_mean),
+    dplyr::desc(f1_mean),
+    dplyr::desc(specificity_mean),
+    variabilidad_total,
+    pr_auc_ic_width,
+    f1_ic_width
+  )
+
+# -------- 5. SELECCIÓN FINAL --------
+mejor_fila <- seleccion_filtrada %>%
+  dplyr::slice(1)
+
+best_model_label <- mejor_fila$modelo
+best_balance <- mejor_fila$balance
+
+# Mapeo automático etiqueta visible -> clave interna del objeto `modelos`
+label_to_key <- stats::setNames(
+  names(modelos),
+  vapply(modelos, function(x) x$label, character(1))
+)
+
+best_model_key <- unname(label_to_key[best_model_label])
+
+if (is.na(best_model_key)) {
+  stop("No se pudo determinar best_model_key a partir de best_model_label.")
+}
+
+# Mostrar ranking final
+seleccion_filtrada %>%
+  dplyr::select(
+    modelo, balance,
+    pr_auc_mean, pr_auc_sd, pr_auc_ic_low, pr_auc_ic_high,
+    f1_mean, f1_sd, f1_ic_low, f1_ic_high,
+    sensitivity_mean, sensitivity_sd, sensitivity_ic_low, sensitivity_ic_high,
+    specificity_mean, specificity_sd, specificity_ic_low, specificity_ic_high,
+    variabilidad_total,
+    pr_auc_ic_width, f1_ic_width,
+    score_final
+  ) %>%
+  dplyr::arrange(dplyr::desc(score_final))
+
+cat("Modelo seleccionado:", best_model_label, "\n")
+cat("Clave del modelo:", best_model_key, "\n")
+cat("Balanceo seleccionado:", best_balance, "\n")
+
+```
+## 10.2. Entrenamiento del modelo final
+
+
+En este bloque se entrena el modelo final utilizando todos los datos disponibles. Se aplica la misma receta de preprocesamiento que en la validación cruzada.
+
+Si el modelo requiere ajuste, se realiza una validación cruzada de 5 pliegues para seleccionar los mejores hiperparámetros según PR AUC. El modelo resultante **fit_modelo_final** queda preparado para su evaluación e interpretación.
+
+```{r entrenamiento_modelo_final, echo=TRUE, warning=FALSE, message=FALSE}
+
+
+set.seed(2026)
+
+rec_final <- make_recipe(
+  stroke_mod,
+  balance = best_balance,
+  seed = 2026
+)
+
+cfg_final <- modelos[[best_model_key]]
+
+wf_final <- workflows::workflow() %>%
+  workflows::add_recipe(rec_final) %>%
+  workflows::add_model(cfg_final$spec)
+
+if (isTRUE(cfg_final$tune)) {
+  inner_rs_final <- rsample::vfold_cv(
+    stroke_mod,
+    v = 5,
+    strata = Ictus
+  )
+
+  tune_res_final <- tune::tune_grid(
+    wf_final,
+    resamples = inner_rs_final,
+    grid = cfg_final$grid,
+    metrics = yardstick::metric_set(yardstick::roc_auc, yardstick::pr_auc),
+    control = tune::control_grid(save_pred = FALSE)
+  )
+
+  best_params_final <- tune::select_best(tune_res_final, metric = "pr_auc")
+  wf_final <- tune::finalize_workflow(wf_final, best_params_final)
+}
+
+fit_modelo_final <- parsnip::fit(wf_final, data = stroke_mod)
+
+```
+
+
+## 10.3. Funciones auxiliares para la evaluación del modelo final.
+
+En este apartado se definen funciones auxiliares que facilitan la evaluación del modelo final. Estas funciones permiten automatizar el cálculo de métricas, la generación de predicciones y la organización de los resultados, garantizando un flujo de trabajo más claro, reproducible y eficiente. Su uso evita la repetición de código y asegura la coherencia en el análisis del rendimiento del modelo.
+
+```{r funciones_auxiliares_modelo_final, echo=TRUE, warning=FALSE, message=FALSE}
+threshold_f1 <- function(truth, prob) {
+  umbrales <- seq(0.01, 0.99, by = 0.01)
+
+  tabla_f1 <- purrr::map_dfr(umbrales, function(thr) {
+    clase_pred <- factor(ifelse(prob >= thr, "Sí", "No"), levels = c("No", "Sí"))
+
+    f1_val <- yardstick::f_meas_vec(
+      truth = truth,
+      estimate = clase_pred,
+      event_level = "second"
+    )
+
+    tibble::tibble(
+      threshold = thr,
+      f1 = f1_val
+    )
+  })
+
+  tabla_f1 %>%
+    dplyr::filter(f1 == max(f1, na.rm = TRUE)) %>%
+    dplyr::slice(1) %>%
+    dplyr::pull(threshold)
+}
+
+metrics_from_prob_thr <- function(truth, prob, thr) {
+  clase_pred <- factor(ifelse(prob >= thr, "Sí", "No"), levels = c("No", "Sí"))
+
+  tibble::tibble(
+    roc_auc = yardstick::roc_auc_vec(truth, prob, event_level = "second"),
+    pr_auc = yardstick::pr_auc_vec(truth, prob, event_level = "second"),
+    accuracy = yardstick::accuracy_vec(truth, clase_pred),
+    sensitivity = yardstick::sens_vec(truth, clase_pred, event_level = "second"),
+    specificity = yardstick::spec_vec(truth, clase_pred, event_level = "second"),
+    f1 = yardstick::f_meas_vec(truth, clase_pred, event_level = "second"),
+    ppv = yardstick::ppv_vec(truth, clase_pred, event_level = "second"),
+    npv = yardstick::npv_vec(truth, clase_pred, event_level = "second"),
+    bal_accuracy = yardstick::bal_accuracy_vec(truth, clase_pred)
+  ) %>%
+    dplyr::mutate(dplyr::across(where(is.numeric), round, 4))
+}
+
+calibrar_probabilidades_platt <- function(preds_eval) {
+  preds_eval <- preds_eval %>%
+    dplyr::mutate(
+      prob_cruda = pmin(pmax(prob_cruda, 1e-6), 1 - 1e-6),
+      logit_crudo = qlogis(prob_cruda),
+      y = ifelse(truth == "Sí", 1, 0)
+    )
+
+  platt_fit <- stats::glm(
+    y ~ logit_crudo,
+    data = preds_eval,
+    family = binomial()
+  )
+
+  preds_eval <- preds_eval %>%
+    dplyr::mutate(
+      prob_calibrada = stats::predict(
+        platt_fit,
+        newdata = tibble::tibble(logit_crudo = logit_crudo),
+        type = "response"
+      ),
+      prob_calibrada = pmin(pmax(prob_calibrada, 1e-6), 1 - 1e-6)
+    )
+
+  list(
+    preds_eval = preds_eval,
+    platt_fit = platt_fit
+  )
+}
+```
+
+
+## 10.4. Evaluación final del modelo seleccionado.
+
+En este apartado se lleva a cabo la evaluación final del modelo seleccionado utilizando las funciones previamente definidas. Se analizan las métricas de rendimiento obtenidas, así como las predicciones generadas, con el objetivo de valorar la capacidad del modelo para discriminar entre pacientes con y sin ictus. Este análisis permite interpretar el comportamiento del modelo en términos de precisión, sensibilidad y especificidad, y evaluar su posible utilidad en un contexto práctico.
+
+
+
+
+
+```{r evaluacion_analisis_modelo_final, echo=TRUE, warning=FALSE, message=FALSE}
+#==================================================
+# FUNCIONES AUXILIARES
+#==================================================
+
+obtener_col_prob_si <- function(df) {
+  candidatos <- c(
+    ".pred_Sí",
+    ".pred_Si",
+    paste0(".pred_", make.names("Sí"))
+  )
+
+  col_encontrada <- intersect(candidatos, names(df))[1]
+
+  if (is.na(col_encontrada)) {
+    stop(
+      paste0(
+        "No se encontró la columna de probabilidad de la clase positiva. ",
+        "Columnas disponibles: ",
+        paste(names(df), collapse = ", ")
+      )
+    )
+  }
+
+  col_encontrada
+}
+
+tabla_estilo_tfm <- function(df,
+                             titulo_superior = NULL,
+                             caption = NULL,
+                             width_col1 = "5cm",
+                             width_otros = "2.5cm",
+                             font_size = 12,
+                             escape = FALSE) {
+
+  n_cols <- ncol(df)
+
+  tb <- df %>%
+    knitr::kable(
+      row.names = FALSE,
+      escape = escape,
+      align = rep("c", n_cols),
+      caption = caption
+    )
+
+  if (!is.null(titulo_superior)) {
+    tb <- tb %>%
+      kableExtra::add_header_above(
+        stats::setNames(n_cols, titulo_superior)
+      )
+  }
+
+  if (n_cols == 1) {
+    tb %>%
+      kableExtra::kable_styling(
+        full_width = FALSE,
+        position = "center",
+        font_size = font_size
+      ) %>%
+      kableExtra::row_spec(
+        0,
+        bold = TRUE,
+        color = "white",
+        background = "#2c3e50"
+      ) %>%
+      kableExtra::column_spec(1, bold = TRUE, width = width_col1)
+  } else {
+    tb %>%
+      kableExtra::kable_styling(
+        full_width = FALSE,
+        position = "center",
+        font_size = font_size
+      ) %>%
+      kableExtra::row_spec(
+        0,
+        bold = TRUE,
+        color = "white",
+        background = "#2c3e50"
+      ) %>%
+      kableExtra::column_spec(1, bold = TRUE, width = width_col1) %>%
+      kableExtra::column_spec(2:n_cols, width = width_otros)
+  }
+}
+
+orden_metricas_principal <- c(
+  "ROC AUC",
+  "PR AUC",
+  "Accuracy",
+  "Sensibilidad",
+  "Especificidad",
+  "F1-score",
+  "PPV",
+  "NPV",
+  "Balanced Accuracy"
+)
+
+formatear_metricas_yardstick <- function(df) {
+  df %>%
+    dplyr::mutate(
+      Métrica = dplyr::recode(
+        .metric,
+        roc_auc = "ROC AUC",
+        pr_auc = "PR AUC",
+        accuracy = "Accuracy",
+        sens = "Sensibilidad",
+        spec = "Especificidad",
+        f_meas = "F1-score",
+        ppv = "PPV",
+        npv = "NPV",
+        bal_accuracy = "Balanced Accuracy"
+      )
+    ) %>%
+    dplyr::select(Métrica, Valor = .estimate) %>%
+    dplyr::mutate(
+      Valor = round(Valor, 4),
+      Métrica = factor(Métrica, levels = orden_metricas_principal)
+    ) %>%
+    dplyr::arrange(Métrica)
+}
+
+formatear_tabla_umbral <- function(df) {
+  df %>%
+    dplyr::select(
+      umbral_final,
+      roc_auc,
+      pr_auc,
+      accuracy,
+      sensitivity,
+      specificity,
+      f1,
+      ppv,
+      npv,
+      bal_accuracy
+    ) %>%
+    dplyr::rename(
+      `Umbral óptimo` = umbral_final,
+      `ROC AUC` = roc_auc,
+      `PR AUC` = pr_auc,
+      `Accuracy` = accuracy,
+      `Sensibilidad` = sensitivity,
+      `Especificidad` = specificity,
+      `F1-score` = f1,
+      `PPV` = ppv,
+      `NPV` = npv,
+      `Balanced Accuracy` = bal_accuracy
+    ) %>%
+    dplyr::mutate(
+      dplyr::across(where(is.numeric), ~ round(.x, 4))
+    )
+}
+
+formatear_variable_or <- function(x) {
+  mapa_variables <- c(
+    "Genero" = "Género",
+    "Hipertension" = "Hipertensión",
+    "Enfermedad_cardiaca" = "Enfermedad cardiaca",
+    "Estado_civil" = "Estado civil",
+    "Tipo_trabajo" = "Tipo trabajo",
+    "Tipo_residencia" = "Tipo residencia",
+    "Estado_tabaquismo" = "Estado tabaquismo",
+    "Edad" = "Edad",
+    "IMC" = "IMC",
+    "log_glucosa" = "Log glucosa",
+    "Grupos_Edad" = "Grupos de edad",
+    "Categorias_IMC" = "Categorías IMC"
+  )
+
+  x <- stringr::str_replace_all(x, "`", "")
+
+  if (!stringr::str_detect(x, "_")) {
+    return(dplyr::recode(x, !!!mapa_variables, .default = x))
+  }
+
+  partes <- stringr::str_split_fixed(x, "_", 2)
+  var_raw <- partes[, 1]
+  cat_raw <- partes[, 2]
+
+  var_fmt <- dplyr::recode(var_raw, !!!mapa_variables, .default = var_raw)
+
+  cat_fmt <- cat_raw %>%
+    stringr::str_replace_all("\\.", " ") %>%
+    stringr::str_replace_all("Si", "Sí") %>%
+    stringr::str_replace_all("No_fuma", "No fuma") %>%
+    stringr::str_replace_all("Nunca_fumo", "Nunca fumó") %>%
+    stringr::str_replace_all("fumaba_anteriormente", "fumaba anteriormente") %>%
+    stringr::str_replace_all("Autonomo", "Autónomo") %>%
+    stringr::str_replace_all("Privado", "Privado") %>%
+    stringr::str_replace_all("Publico", "Público") %>%
+    stringr::str_replace_all("Urbana", "Urbana") %>%
+    stringr::str_replace_all("Mujer", "Mujer") %>%
+    stringr::str_replace_all("Niños", "Niños") %>%
+    stringr::str_squish()
+
+  paste0(cat_fmt, " (", var_fmt, ")")
+}
+
+formatear_matriz_confusion <- function(cm_final) {
+  cm_final$table %>%
+    as.data.frame() %>%
+    dplyr::rename(
+      `Predicción` = Prediction,
+      `Hecho Real` = Truth,
+      `Frecuencia` = Freq
+    )
+}
+
+plot_roc_final <- function(preds_final,
+                           truth_col = "Ictus",
+                           prob_col = "prob_calibrada",
+                           titulo = "Curva ROC del modelo calibrado") {
+
+  roc_curve_df <- yardstick::roc_curve(
+    preds_final,
+    truth = !!rlang::sym(truth_col),
+    !!rlang::sym(prob_col),
+    event_level = "second"
+  )
+
+  roc_auc_df <- yardstick::roc_auc(
+    preds_final,
+    truth = !!rlang::sym(truth_col),
+    !!rlang::sym(prob_col),
+    event_level = "second"
+  )
+
+  auc_txt <- paste0("AUC = ", round(roc_auc_df$.estimate, 3))
+
+  ggplot2::ggplot(
+    roc_curve_df,
+    ggplot2::aes(x = 1 - specificity, y = sensitivity)
+  ) +
+    ggplot2::geom_abline(
+      slope = 1,
+      intercept = 0,
+      linetype = 2,
+      color = "grey50"
+    ) +
+    ggplot2::geom_path(
+      linewidth = 1.2,
+      color = "darkcyan"
+    ) +
+    ggplot2::annotate(
+      "text",
+      x = 0.65, y = 0.1,
+      label = auc_txt,
+      hjust = 0,
+      size = 5
+    ) +
+    ggplot2::coord_equal() +
+    ggplot2::theme_minimal(base_size = 13) +
+    ggplot2::labs(
+      title = titulo,
+      x = "1 - Especificidad",
+      y = "Sensibilidad"
+    )
+}
+
+calibrar_probabilidades_platt <- function(preds_eval) {
+  preds_eval <- preds_eval %>%
+    dplyr::mutate(
+      prob_cruda = pmin(pmax(prob_cruda, 1e-6), 1 - 1e-6),
+      logit_crudo = qlogis(prob_cruda),
+      y = ifelse(truth == "Sí", 1, 0)
+    )
+
+  platt_fit <- stats::glm(
+    y ~ logit_crudo,
+    data = preds_eval,
+    family = binomial()
+  )
+
+  preds_eval <- preds_eval %>%
+    dplyr::mutate(
+      prob_calibrada = stats::predict(
+        platt_fit,
+        newdata = tibble::tibble(logit_crudo = logit_crudo),
+        type = "response"
+      ),
+      prob_calibrada = pmin(pmax(prob_calibrada, 1e-6), 1 - 1e-6)
+    )
+
+  list(
+    preds_eval = preds_eval,
+    platt_fit = platt_fit
+  )
+}
+
+#==================================================
+# ANÁLISIS FINAL - REGRESIÓN LOGÍSTICA
+#==================================================
+
+analisis_final_logistica <- function(fit_modelo_final,
+                                     predicciones_todos_modelos,
+                                     best_model_label,
+                                     best_balance,
+                                     stroke_mod) {
+
+  # -----------------------------
+  # Evaluación externa
+  # -----------------------------
+  preds_eval_raw <- predicciones_todos_modelos %>%
+    dplyr::filter(
+      modelo == best_model_label,
+      balance == best_balance
+    )
+
+  col_prob_si_eval <- obtener_col_prob_si(preds_eval_raw)
+
+  preds_eval <- preds_eval_raw %>%
+    dplyr::transmute(
+      truth = factor(Ictus, levels = c("No", "Sí")),
+      prob_cruda = .data[[col_prob_si_eval]]
+    )
+
+  calib <- calibrar_probabilidades_platt(preds_eval)
+  preds_eval <- calib$preds_eval
+  platt_fit  <- calib$platt_fit
+
+  resumen_platt <- broom::tidy(platt_fit, conf.int = TRUE) %>%
+    dplyr::mutate(
+      estimate = round(estimate, 4),
+      conf.low = round(conf.low, 4),
+      conf.high = round(conf.high, 4),
+      p.value = signif(p.value, 3)
+    )
+
+  print(
+    tabla_estilo_tfm(
+      resumen_platt,
+      titulo_superior = "Modelo de calibración de Platt en evaluación externa",
+      caption = "Modelo de calibración de Platt ajustado sobre la evaluación externa",
+      width_col1 = "4cm",
+      width_otros = "3cm"
+    )
+  )
+
+  preds_eval_long <- preds_eval %>%
+    dplyr::select(truth, prob_cruda, prob_calibrada) %>%
+    tidyr::pivot_longer(
+      cols = c(prob_cruda, prob_calibrada),
+      names_to = "tipo",
+      values_to = "probabilidad"
+    ) %>%
+    dplyr::mutate(
+      tipo = dplyr::recode(
+        tipo,
+        prob_cruda = "Probabilidad cruda",
+        prob_calibrada = "Probabilidad calibrada"
+      )
+    )
+
+  print(
+    ggplot2::ggplot(
+      preds_eval_long,
+      ggplot2::aes(x = probabilidad, fill = tipo)
+    ) +
+      ggplot2::geom_histogram(
+        alpha = 0.45,
+        bins = 30,
+        position = "identity"
+      ) +
+      ggplot2::facet_wrap(~ truth, ncol = 1) +
+      ggplot2::theme_minimal(base_size = 13) +
+      ggplot2::labs(
+        title = "Distribución de probabilidades crudas y calibradas en evaluación externa",
+        x = "Probabilidad predicha",
+        y = "Frecuencia",
+        fill = NULL
+      )
+  )
+
+  calib_plot_df <- preds_eval %>%
+    dplyr::mutate(
+      bin = dplyr::ntile(prob_calibrada, 10)
+    ) %>%
+    dplyr::group_by(bin) %>%
+    dplyr::summarise(
+      prob_media = mean(prob_calibrada, na.rm = TRUE),
+      frac_positivos = mean(truth == "Sí", na.rm = TRUE),
+      n = dplyr::n(),
+      .groups = "drop"
+    )
+
+  print(
+    ggplot2::ggplot(
+      calib_plot_df,
+      ggplot2::aes(x = prob_media, y = frac_positivos)
+    ) +
+      ggplot2::geom_abline(
+        slope = 1,
+        intercept = 0,
+        linetype = 2,
+        color = "grey40"
+      ) +
+      ggplot2::geom_point(size = 2.5, color = "darkcyan") +
+      ggplot2::geom_line(color = "darkcyan") +
+      ggplot2::coord_equal() +
+      ggplot2::theme_minimal(base_size = 13) +
+      ggplot2::labs(
+        title = "Curva de calibración tras Platt en evaluación externa",
+        x = "Probabilidad media predicha",
+        y = "Fracción observada de ictus"
+      )
+  )
+
+  thr_final <- threshold_f1(
+    truth = preds_eval$truth,
+    prob  = preds_eval$prob_calibrada
+  )
+
+  tabla_umbral_final <- tibble::tibble(
+    umbral_final = thr_final
+  ) %>%
+    dplyr::bind_cols(
+      metrics_from_prob_thr(
+        truth = preds_eval$truth,
+        prob  = preds_eval$prob_calibrada,
+        thr   = thr_final
+      )
+    )
+
+  print(
+    tabla_estilo_tfm(
+      formatear_tabla_umbral(tabla_umbral_final),
+      titulo_superior = "Umbral óptimo y métricas en evaluación externa",
+      caption = "Umbral óptimo de clasificación y métricas asociadas en la evaluación externa",
+      width_col1 = "3.5cm",
+      width_otros = "2.4cm"
+    )
+  )
+
+  preds_eval_clas <- preds_eval %>%
+    dplyr::mutate(
+      pred_clase = factor(
+        ifelse(prob_calibrada >= thr_final, "Sí", "No"),
+        levels = c("No", "Sí")
+      )
+    )
+
+  print(
+    ggplot2::ggplot(
+      preds_eval_clas,
+      ggplot2::aes(x = prob_calibrada, fill = truth)
+    ) +
+      ggplot2::geom_histogram(
+        bins = 30,
+        alpha = 0.5,
+        position = "identity"
+      ) +
+      ggplot2::geom_vline(
+        xintercept = thr_final,
+        linetype = 2,
+        linewidth = 1
+      ) +
+      ggplot2::theme_minimal(base_size = 13) +
+      ggplot2::labs(
+        title = "Distribución de probabilidades calibradas y umbral en evaluación externa",
+        x = "Probabilidad calibrada",
+        y = "Frecuencia",
+        fill = "Ictus"
+      )
+  )
+
+  print(
+    plot_roc_final(
+      preds_final = preds_eval,
+      truth_col = "truth",
+      prob_col = "prob_calibrada",
+      titulo = "Curva ROC del modelo calibrado en evaluación externa (Regresión logística)"
+    )
+  )
+
+  metricas_eval_calibrado <- yardstick::metric_set(
+    yardstick::roc_auc,
+    yardstick::pr_auc,
+    yardstick::accuracy,
+    yardstick::sens,
+    yardstick::spec,
+    yardstick::f_meas,
+    yardstick::ppv,
+    yardstick::npv,
+    yardstick::bal_accuracy
+  )
+
+  resultados_eval_calibrado <- metricas_eval_calibrado(
+    preds_eval_clas,
+    truth = truth,
+    estimate = pred_clase,
+    prob_calibrada,
+    event_level = "second"
+  )
+
+  print(
+    tabla_estilo_tfm(
+      formatear_metricas_yardstick(resultados_eval_calibrado),
+      titulo_superior = "Rendimiento del modelo calibrado en evaluación externa",
+      caption = "Rendimiento del modelo de regresión logística calibrado en la evaluación externa",
+      width_col1 = "4cm",
+      width_otros = "3cm"
+    )
+  )
+
+  cm_final <- yardstick::conf_mat(
+    data = preds_eval_clas,
+    truth = truth,
+    estimate = pred_clase
+  )
+
+  cm_final_df <- formatear_matriz_confusion(cm_final)
+
+  print(
+    tabla_estilo_tfm(
+      cm_final_df,
+      titulo_superior = "Matriz de confusión en evaluación externa",
+      caption = "Matriz de confusión del modelo calibrado en evaluación externa",
+      width_col1 = "3.5cm",
+      width_otros = "3.5cm"
+    )
+  )
+
+  preds_eval_compare <- preds_eval %>%
+    dplyr::mutate(
+      clase_predicha_original = factor(
+        ifelse(prob_cruda >= thr_final, "Sí", "No"),
+        levels = c("No", "Sí")
+      ),
+      clase_predicha_calibrada = factor(
+        ifelse(prob_calibrada >= thr_final, "Sí", "No"),
+        levels = c("No", "Sí")
+      )
+    )
+
+  metricas_cmp <- dplyr::bind_rows(
+    yardstick::metric_set(
+      yardstick::accuracy,
+      yardstick::sens,
+      yardstick::spec,
+      yardstick::f_meas,
+      yardstick::ppv,
+      yardstick::npv,
+      yardstick::bal_accuracy
+    )(
+      preds_eval_compare,
+      truth = truth,
+      estimate = clase_predicha_original,
+      event_level = "second"
+    ) %>%
+      dplyr::mutate(Modelo = "Antes de calibración"),
+
+    yardstick::metric_set(
+      yardstick::accuracy,
+      yardstick::sens,
+      yardstick::spec,
+      yardstick::f_meas,
+      yardstick::ppv,
+      yardstick::npv,
+      yardstick::bal_accuracy
+    )(
+      preds_eval_compare,
+      truth = truth,
+      estimate = clase_predicha_calibrada,
+      event_level = "second"
+    ) %>%
+      dplyr::mutate(Modelo = "Después de calibración")
+  ) %>%
+    dplyr::mutate(
+      Métrica = dplyr::recode(
+        .metric,
+        accuracy = "Accuracy",
+        sens = "Sensibilidad",
+        spec = "Especificidad",
+        f_meas = "F1-score",
+        ppv = "PPV",
+        npv = "NPV",
+        bal_accuracy = "Balanced Accuracy"
+      ),
+      Valor = round(.estimate, 4)
+    ) %>%
+    dplyr::select(Modelo, Métrica, Valor)
+
+  metricas_cmp_fmt <- metricas_cmp %>%
+    tidyr::pivot_wider(
+      names_from = Modelo,
+      values_from = Valor
+    ) %>%
+    dplyr::mutate(
+      Métrica = factor(
+        Métrica,
+        levels = c(
+          "Accuracy",
+          "Sensibilidad",
+          "Especificidad",
+          "F1-score",
+          "PPV",
+          "NPV",
+          "Balanced Accuracy"
+        )
+      )
+    ) %>%
+    dplyr::arrange(Métrica)
+
+  print(
+    tabla_estilo_tfm(
+      metricas_cmp_fmt,
+      titulo_superior = "Comparación de métricas antes y después de la calibración",
+      caption = "Comparación de métricas en evaluación externa antes y después de la calibración",
+      width_col1 = "5cm",
+      width_otros = "3cm"
+    )
+  )
+
+  # -----------------------------
+  # Aplicación descriptiva al conjunto completo
+  # -----------------------------
+  pred_final_raw <- predict(
+    fit_modelo_final,
+    new_data = stroke_mod,
+    type = "prob"
+  ) %>%
+    dplyr::bind_cols(stroke_mod %>% dplyr::select(Ictus))
+
+  col_prob_si_final <- obtener_col_prob_si(pred_final_raw)
+
+  pred_final <- pred_final_raw %>%
+    dplyr::rename(prob_cruda = all_of(col_prob_si_final)) %>%
+    dplyr::mutate(
+      prob_cruda = pmin(pmax(prob_cruda, 1e-6), 1 - 1e-6),
+      logit_crudo = qlogis(prob_cruda),
+      prob_calibrada = stats::predict(
+        platt_fit,
+        newdata = tibble::tibble(logit_crudo = logit_crudo),
+        type = "response"
+      ),
+      prob_calibrada = pmin(pmax(prob_calibrada, 1e-6), 1 - 1e-6),
+      pred_clase = factor(
+        ifelse(prob_calibrada >= thr_final, "Sí", "No"),
+        levels = c("No", "Sí")
+      )
+    )
+
+  comparacion_calibracion <- pred_final %>%
+    dplyr::summarise(
+      prob_cruda_media = mean(prob_cruda, na.rm = TRUE),
+      prob_calib_media = mean(prob_calibrada, na.rm = TRUE),
+      prevalencia_real = mean(Ictus == "Sí", na.rm = TRUE),
+      sesgo_crudo = prob_cruda_media / prevalencia_real,
+      sesgo_calib = prob_calib_media / prevalencia_real
+    ) %>%
+    dplyr::mutate(
+      dplyr::across(where(is.numeric), ~ round(.x, 4))
+    )
+
+  print(
+    tabla_estilo_tfm(
+      comparacion_calibracion,
+      titulo_superior = "Efecto descriptivo de la calibración de Platt en el conjunto completo",
+      caption = "Efecto descriptivo de la calibración de Platt aplicado al conjunto completo",
+      width_col1 = "4cm",
+      width_otros = "3cm"
+    )
+  )
+
+  resumen_probs <- pred_final %>%
+    dplyr::summarise(
+      min_prob_cruda = min(prob_cruda, na.rm = TRUE),
+      max_prob_cruda = max(prob_cruda, na.rm = TRUE),
+      media_prob_cruda = mean(prob_cruda, na.rm = TRUE),
+      min_prob_calib = min(prob_calibrada, na.rm = TRUE),
+      max_prob_calib = max(prob_calibrada, na.rm = TRUE),
+      media_prob_calib = mean(prob_calibrada, na.rm = TRUE),
+      prevalencia = mean(Ictus == "Sí", na.rm = TRUE)
+    ) %>%
+    dplyr::mutate(
+      dplyr::across(where(is.numeric), ~ round(.x, 4))
+    )
+
+  print(
+    tabla_estilo_tfm(
+      resumen_probs,
+      titulo_superior = "Resumen descriptivo de probabilidades en el conjunto completo",
+      caption = "Resumen descriptivo de probabilidades crudas y calibradas en el conjunto completo",
+      width_col1 = "4cm",
+      width_otros = "3cm"
+    )
+  )
+
+  print(
+    ggplot2::ggplot(
+      pred_final,
+      ggplot2::aes(x = prob_calibrada, fill = Ictus)
+    ) +
+      ggplot2::geom_histogram(
+        bins = 30,
+        alpha = 0.5,
+        position = "identity"
+      ) +
+      ggplot2::geom_vline(
+        xintercept = thr_final,
+        linetype = 2,
+        linewidth = 1
+      ) +
+      ggplot2::theme_minimal(base_size = 13) +
+      ggplot2::labs(
+        title = "Distribución de probabilidades calibradas en el conjunto completo",
+        subtitle = "Umbral óptimo obtenido en evaluación externa",
+        x = "Probabilidad calibrada",
+        y = "Frecuencia",
+        fill = "Ictus"
+      )
+  )
+
+  print(
+    ggplot2::ggplot(
+      pred_final,
+      ggplot2::aes(
+        x = prob_calibrada,
+        y = as.numeric(Ictus == "Sí")
+      )
+    ) +
+      ggplot2::geom_smooth(
+        method = "glm",
+        method.args = list(family = "binomial"),
+        se = TRUE,
+        color = "darkcyan"
+      ) +
+      ggplot2::geom_jitter(
+        alpha = 0.08,
+        height = 0.03,
+        width = 0,
+        color = "grey30"
+      ) +
+      ggplot2::theme_minimal(base_size = 13) +
+      ggplot2::labs(
+        title = "Relación entre probabilidad calibrada y outcome real en el conjunto completo",
+        x = "Probabilidad calibrada",
+        y = "Ictus observado (0/1)"
+      )
+  )
+
+  # -----------------------------
+  # Interpretabilidad del modelo final
+  # -----------------------------
+  modelo_logit_motor <- workflows::extract_fit_engine(fit_modelo_final)
+  print(summary(modelo_logit_motor))
+
+  modelo_logit_parsnip <- workflows::extract_fit_parsnip(fit_modelo_final)
+  penalty_final <- modelo_logit_parsnip$spec$args$penalty
+  penalty_final <- rlang::eval_tidy(penalty_final)
+
+  coef_logit_raw <- broom::tidy(modelo_logit_motor)
+
+  if (!"lambda" %in% names(coef_logit_raw)) {
+    stop("La salida de broom::tidy(modelo_logit_motor) no contiene la columna 'lambda'.")
+  }
+
+  coef_logit <- coef_logit_raw %>%
+    dplyr::mutate(dist_penalty = abs(lambda - penalty_final)) %>%
+    dplyr::filter(dist_penalty == min(dist_penalty, na.rm = TRUE)) %>%
+    dplyr::filter(term != "(Intercept)") %>%
+    dplyr::mutate(
+      Variable = vapply(term, formatear_variable_or, character(1)),
+      Coeficiente = round(estimate, 4),
+      OR = round(exp(estimate), 4)
+    ) %>%
+    dplyr::select(
+      Variable,
+      Coeficiente,
+      OR
+    ) %>%
+    dplyr::arrange(dplyr::desc(abs(Coeficiente)))
+
+  print(
+    tabla_estilo_tfm(
+      coef_logit,
+      titulo_superior = "Odds ratios del modelo final de regresión logística penalizada",
+      caption = "Odds ratios del modelo final de regresión logística penalizada",
+      width_col1 = "7cm",
+      width_otros = "3cm"
+    )
+  )
+
+  imp_logit <- coef_logit_raw %>%
+    dplyr::mutate(dist_penalty = abs(lambda - penalty_final)) %>%
+    dplyr::filter(dist_penalty == min(dist_penalty, na.rm = TRUE)) %>%
+    dplyr::filter(term != "(Intercept)") %>%
+    dplyr::mutate(
+      Variable = vapply(term, formatear_variable_or, character(1)),
+      importancia = abs(estimate)
+    ) %>%
+    dplyr::arrange(dplyr::desc(importancia))
+
+  print(
+    ggplot2::ggplot(
+      imp_logit,
+      ggplot2::aes(x = reorder(Variable, importancia), y = importancia)
+    ) +
+      ggplot2::geom_col(fill = "darkcyan") +
+      ggplot2::coord_flip() +
+      ggplot2::theme_minimal(base_size = 13) +
+      ggplot2::labs(
+        title = "Importancia relativa de variables en la regresión logística penalizada",
+        subtitle = paste0("Coeficientes absolutos para lambda = ", round(penalty_final, 6)),
+        x = "Variable",
+        y = "|Coeficiente|"
+      )
+  )
+
+  or_plot <- coef_logit_raw %>%
+    dplyr::mutate(dist_penalty = abs(lambda - penalty_final)) %>%
+    dplyr::filter(dist_penalty == min(dist_penalty, na.rm = TRUE)) %>%
+    dplyr::filter(term != "(Intercept)") %>%
+    dplyr::mutate(
+      Variable = vapply(term, formatear_variable_or, character(1)),
+      OR = exp(estimate),
+      efecto = dplyr::if_else(OR > 1, "Riesgo", "Protector")
+    ) %>%
+    dplyr::arrange(OR) %>%
+    dplyr::mutate(Variable = factor(Variable, levels = Variable))
+
+  print(
+    ggplot2::ggplot(
+      or_plot,
+      ggplot2::aes(x = OR, y = Variable, color = efecto)
+    ) +
+      ggplot2::geom_point(size = 3) +
+      ggplot2::geom_vline(xintercept = 1, linetype = "dashed") +
+      ggplot2::scale_color_manual(
+        values = c("Riesgo" = "firebrick", "Protector" = "steelblue")
+      ) +
+      ggplot2::theme_minimal(base_size = 13) +
+      ggplot2::labs(
+        title = "Odds ratios del modelo final glmnet",
+        subtitle = paste0("Coeficientes para lambda = ", round(penalty_final, 6)),
+        x = "Odds Ratio",
+        y = "Variable",
+        color = NULL
+      )
+  )
+
+  invisible(
+    list(
+      preds_eval = preds_eval,
+      preds_eval_clas = preds_eval_clas,
+      platt_fit = platt_fit,
+      thr_final = thr_final,
+      pred_final = pred_final,
+      resultados_eval_calibrado = resultados_eval_calibrado,
+      tabla_umbral_final = tabla_umbral_final,
+      coef_logit = coef_logit
+    )
+  )
+}
+
+#==================================================
+# ANÁLISIS FINAL - RANDOM FOREST
+#==================================================
+
+analisis_final_rf <- function(fit_modelo_final,
+                              predicciones_todos_modelos,
+                              best_model_label,
+                              best_balance,
+                              stroke_mod) {
+
+  preds_eval_raw <- predicciones_todos_modelos %>%
+    dplyr::filter(
+      modelo == best_model_label,
+      balance == best_balance
+    )
+
+  col_prob_si_eval <- obtener_col_prob_si(preds_eval_raw)
+
+  preds_eval <- preds_eval_raw %>%
+    dplyr::transmute(
+      truth = factor(Ictus, levels = c("No", "Sí")),
+      prob_cruda = .data[[col_prob_si_eval]]
+    )
+
+  calib <- calibrar_probabilidades_platt(preds_eval)
+  preds_eval <- calib$preds_eval
+  platt_fit  <- calib$platt_fit
+
+  resumen_platt <- broom::tidy(platt_fit, conf.int = TRUE) %>%
+    dplyr::mutate(
+      estimate = round(estimate, 4),
+      conf.low = round(conf.low, 4),
+      conf.high = round(conf.high, 4),
+      p.value = signif(p.value, 3)
+    )
+
+  print(
+    tabla_estilo_tfm(
+      resumen_platt,
+      titulo_superior = "Modelo de calibración de Platt en evaluación externa",
+      caption = "Modelo de calibración de Platt ajustado sobre la evaluación externa",
+      width_col1 = "4cm",
+      width_otros = "3cm"
+    )
+  )
+
+  thr_final <- threshold_f1(
+    truth = preds_eval$truth,
+    prob  = preds_eval$prob_calibrada
+  )
+
+  tabla_umbral_final <- tibble::tibble(
+    umbral_final = thr_final
+  ) %>%
+    dplyr::bind_cols(
+      metrics_from_prob_thr(
+        truth = preds_eval$truth,
+        prob  = preds_eval$prob_calibrada,
+        thr   = thr_final
+      )
+    )
+
+  print(
+    tabla_estilo_tfm(
+      formatear_tabla_umbral(tabla_umbral_final),
+      titulo_superior = "Umbral óptimo y métricas en evaluación externa",
+      caption = "Umbral óptimo de clasificación y métricas asociadas del Random Forest calibrado en evaluación externa",
+      width_col1 = "3.5cm",
+      width_otros = "2.4cm"
+    )
+  )
+
+  preds_eval_clas <- preds_eval %>%
+    dplyr::mutate(
+      pred_clase = factor(
+        ifelse(prob_calibrada >= thr_final, "Sí", "No"),
+        levels = c("No", "Sí")
+      )
+    )
+
+  print(
+    plot_roc_final(
+      preds_final = preds_eval,
+      truth_col = "truth",
+      prob_col = "prob_calibrada",
+      titulo = "Curva ROC del Random Forest calibrado en evaluación externa"
+    )
+  )
+
+  metricas_eval_calibrado <- yardstick::metric_set(
+    yardstick::roc_auc,
+    yardstick::pr_auc,
+    yardstick::accuracy,
+    yardstick::sens,
+    yardstick::spec,
+    yardstick::f_meas,
+    yardstick::ppv,
+    yardstick::npv,
+    yardstick::bal_accuracy
+  )
+
+  resultados_eval_calibrado <- metricas_eval_calibrado(
+    preds_eval_clas,
+    truth = truth,
+    estimate = pred_clase,
+    prob_calibrada,
+    event_level = "second"
+  )
+
+  print(
+    tabla_estilo_tfm(
+      formatear_metricas_yardstick(resultados_eval_calibrado),
+      titulo_superior = "Rendimiento del Random Forest calibrado en evaluación externa",
+      caption = "Rendimiento del Random Forest calibrado en la evaluación externa",
+      width_col1 = "4cm",
+      width_otros = "3cm"
+    )
+  )
+
+  cm_final <- yardstick::conf_mat(
+    data = preds_eval_clas,
+    truth = truth,
+    estimate = pred_clase
+  )
+
+  cm_final_df <- formatear_matriz_confusion(cm_final)
+
+  print(
+    tabla_estilo_tfm(
+      cm_final_df,
+      titulo_superior = "Matriz de confusión en evaluación externa",
+      caption = "Matriz de confusión del Random Forest calibrado en evaluación externa",
+      width_col1 = "3.5cm",
+      width_otros = "3.5cm"
+    )
+  )
+
+  pred_final_raw <- predict(fit_modelo_final, new_data = stroke_mod, type = "prob") %>%
+    dplyr::bind_cols(stroke_mod %>% dplyr::select(Ictus))
+
+  col_prob_si_final <- obtener_col_prob_si(pred_final_raw)
+
+  pred_final <- pred_final_raw %>%
+    dplyr::rename(prob_cruda = all_of(col_prob_si_final)) %>%
+    dplyr::mutate(
+      prob_cruda = pmin(pmax(prob_cruda, 1e-6), 1 - 1e-6),
+      logit_crudo = qlogis(prob_cruda),
+      prob_calibrada = stats::predict(
+        platt_fit,
+        newdata = tibble::tibble(logit_crudo = logit_crudo),
+        type = "response"
+      ),
+      prob_calibrada = pmin(pmax(prob_calibrada, 1e-6), 1 - 1e-6),
+      pred_clase = factor(
+        ifelse(prob_calibrada >= thr_final, "Sí", "No"),
+        levels = c("No", "Sí")
+      )
+    )
+
+  print(
+    ggplot2::ggplot(
+      pred_final,
+      ggplot2::aes(x = prob_calibrada, fill = Ictus)
+    ) +
+      ggplot2::geom_histogram(
+        bins = 30,
+        alpha = 0.5,
+        position = "identity"
+      ) +
+      ggplot2::geom_vline(
+        xintercept = thr_final,
+        linetype = 2,
+        linewidth = 1
+      ) +
+      ggplot2::theme_minimal(base_size = 13) +
+      ggplot2::labs(
+        title = "Distribución de probabilidades calibradas en el conjunto completo",
+        subtitle = "Umbral óptimo obtenido en evaluación externa",
+        x = "Probabilidad calibrada",
+        y = "Frecuencia",
+        fill = "Ictus"
+      )
+  )
+
+  motor_rf <- workflows::extract_fit_engine(fit_modelo_final)
+
+  if ("variable.importance" %in% names(motor_rf)) {
+    imp_rf <- tibble::tibble(
+      Variable = names(motor_rf$variable.importance),
+      Importancia = unname(motor_rf$variable.importance)
+    ) %>%
+      dplyr::arrange(dplyr::desc(Importancia)) %>%
+      dplyr::mutate(
+        Importancia = round(Importancia, 4)
+      )
+
+    print(
+      tabla_estilo_tfm(
+        imp_rf,
+        titulo_superior = "Importancia de variables del Random Forest",
+        caption = "Importancia de variables del Random Forest final",
+        width_col1 = "6cm",
+        width_otros = "3cm"
+      )
+    )
+
+    print(
+      ggplot2::ggplot(
+        imp_rf,
+        ggplot2::aes(x = reorder(Variable, Importancia), y = Importancia)
+      ) +
+        ggplot2::geom_col(fill = "darkcyan") +
+        ggplot2::coord_flip() +
+        ggplot2::theme_minimal(base_size = 13) +
+        ggplot2::labs(
+          title = "Importancia de variables del Random Forest",
+          x = "Variable",
+          y = "Importancia"
+        )
+    )
+  }
+
+  print(
+    vip::vip(
+      motor_rf,
+      num_features = 10,
+      geom = "col",
+      aesthetics = list(fill = "darkcyan")
+    ) +
+      ggplot2::theme_minimal(base_size = 13) +
+      ggplot2::labs(
+        title = "VIP del Random Forest",
+        x = "Importancia",
+        y = "Variable"
+      )
+  )
+
+  invisible(
+    list(
+      preds_eval = preds_eval,
+      preds_eval_clas = preds_eval_clas,
+      platt_fit = platt_fit,
+      thr_final = thr_final,
+      pred_final = pred_final,
+      resultados_eval_calibrado = resultados_eval_calibrado
+    )
+  )
+}
+
+#==================================================
+# ANÁLISIS FINAL - ÁRBOL DE DECISIÓN
+#==================================================
+
+analisis_final_arbol <- function(fit_modelo_final,
+                                 predicciones_todos_modelos,
+                                 best_model_label,
+                                 best_balance,
+                                 stroke_mod) {
+
+  preds_eval_raw <- predicciones_todos_modelos %>%
+    dplyr::filter(
+      modelo == best_model_label,
+      balance == best_balance
+    )
+
+  col_prob_si_eval <- obtener_col_prob_si(preds_eval_raw)
+
+  preds_eval <- preds_eval_raw %>%
+    dplyr::transmute(
+      truth = factor(Ictus, levels = c("No", "Sí")),
+      prob_cruda = .data[[col_prob_si_eval]]
+    )
+
+  calib <- calibrar_probabilidades_platt(preds_eval)
+  preds_eval <- calib$preds_eval
+  platt_fit  <- calib$platt_fit
+
+  resumen_platt <- broom::tidy(platt_fit, conf.int = TRUE) %>%
+    dplyr::mutate(
+      estimate = round(estimate, 4),
+      conf.low = round(conf.low, 4),
+      conf.high = round(conf.high, 4),
+      p.value = signif(p.value, 3)
+    )
+
+  print(
+    tabla_estilo_tfm(
+      resumen_platt,
+      titulo_superior = "Modelo de calibración de Platt en evaluación externa",
+      caption = "Modelo de calibración de Platt ajustado sobre la evaluación externa",
+      width_col1 = "4cm",
+      width_otros = "3cm"
+    )
+  )
+
+  thr_final <- threshold_f1(
+    truth = preds_eval$truth,
+    prob  = preds_eval$prob_calibrada
+  )
+
+  tabla_umbral_final <- tibble::tibble(
+    umbral_final = thr_final
+  ) %>%
+    dplyr::bind_cols(
+      metrics_from_prob_thr(
+        truth = preds_eval$truth,
+        prob  = preds_eval$prob_calibrada,
+        thr   = thr_final
+      )
+    )
+
+  print(
+    tabla_estilo_tfm(
+      formatear_tabla_umbral(tabla_umbral_final),
+      titulo_superior = "Umbral óptimo y métricas en evaluación externa",
+      caption = "Umbral óptimo de clasificación y métricas asociadas del árbol calibrado en evaluación externa",
+      width_col1 = "3.5cm",
+      width_otros = "2.4cm"
+    )
+  )
+
+  preds_eval_clas <- preds_eval %>%
+    dplyr::mutate(
+      pred_clase = factor(
+        ifelse(prob_calibrada >= thr_final, "Sí", "No"),
+        levels = c("No", "Sí")
+      )
+    )
+
+  print(
+    plot_roc_final(
+      preds_final = preds_eval,
+      truth_col = "truth",
+      prob_col = "prob_calibrada",
+      titulo = "Curva ROC del árbol calibrado en evaluación externa"
+    )
+  )
+
+  metricas_eval_calibrado <- yardstick::metric_set(
+    yardstick::roc_auc,
+    yardstick::pr_auc,
+    yardstick::accuracy,
+    yardstick::sens,
+    yardstick::spec,
+    yardstick::f_meas,
+    yardstick::ppv,
+    yardstick::npv,
+    yardstick::bal_accuracy
+  )
+
+  resultados_eval_calibrado <- metricas_eval_calibrado(
+    preds_eval_clas,
+    truth = truth,
+    estimate = pred_clase,
+    prob_calibrada,
+    event_level = "second"
+  )
+
+  print(
+    tabla_estilo_tfm(
+      formatear_metricas_yardstick(resultados_eval_calibrado),
+      titulo_superior = "Rendimiento del árbol calibrado en evaluación externa",
+      caption = "Rendimiento del árbol calibrado en la evaluación externa",
+      width_col1 = "4cm",
+      width_otros = "3cm"
+    )
+  )
+
+  cm_final <- yardstick::conf_mat(
+    data = preds_eval_clas,
+    truth = truth,
+    estimate = pred_clase
+  )
+
+  cm_final_df <- formatear_matriz_confusion(cm_final)
+
+  print(
+    tabla_estilo_tfm(
+      cm_final_df,
+      titulo_superior = "Matriz de confusión en evaluación externa",
+      caption = "Matriz de confusión del árbol calibrado en evaluación externa",
+      width_col1 = "3.5cm",
+      width_otros = "3.5cm"
+    )
+  )
+
+  pred_final_raw <- predict(fit_modelo_final, new_data = stroke_mod, type = "prob") %>%
+    dplyr::bind_cols(stroke_mod %>% dplyr::select(Ictus))
+
+  col_prob_si_final <- obtener_col_prob_si(pred_final_raw)
+
+  pred_final <- pred_final_raw %>%
+    dplyr::rename(prob_cruda = all_of(col_prob_si_final)) %>%
+    dplyr::mutate(
+      prob_cruda = pmin(pmax(prob_cruda, 1e-6), 1 - 1e-6),
+      logit_crudo = qlogis(prob_cruda),
+      prob_calibrada = stats::predict(
+        platt_fit,
+        newdata = tibble::tibble(logit_crudo = logit_crudo),
+        type = "response"
+      ),
+      prob_calibrada = pmin(pmax(prob_calibrada, 1e-6), 1 - 1e-6),
+      pred_clase = factor(
+        ifelse(prob_calibrada >= thr_final, "Sí", "No"),
+        levels = c("No", "Sí")
+      )
+    )
+
+  print(
+    ggplot2::ggplot(
+      pred_final,
+      ggplot2::aes(x = prob_calibrada, fill = Ictus)
+    ) +
+      ggplot2::geom_histogram(
+        bins = 30,
+        alpha = 0.5,
+        position = "identity"
+      ) +
+      ggplot2::geom_vline(
+        xintercept = thr_final,
+        linetype = 2,
+        linewidth = 1
+      ) +
+      ggplot2::theme_minimal(base_size = 13) +
+      ggplot2::labs(
+        title = "Distribución de probabilidades calibradas en el conjunto completo",
+        subtitle = "Umbral óptimo obtenido en evaluación externa",
+        x = "Probabilidad calibrada",
+        y = "Frecuencia",
+        fill = "Ictus"
+      )
+  )
+
+  motor_arbol <- workflows::extract_fit_engine(fit_modelo_final)
+
+  if (inherits(motor_arbol, "rpart")) {
+    rpart.plot::rpart.plot(
+      motor_arbol,
+      type = 2,
+      extra = 104,
+      fallen.leaves = TRUE,
+      box.palette = "Blues",
+      shadow.col = "gray",
+      nn = TRUE,
+      main = "Árbol de decisión final para predicción de ictus"
+    )
+  }
+
+  invisible(
+    list(
+      preds_eval = preds_eval,
+      preds_eval_clas = preds_eval_clas,
+      platt_fit = platt_fit,
+      thr_final = thr_final,
+      pred_final = pred_final,
+      resultados_eval_calibrado = resultados_eval_calibrado
+    )
+  )
+}
+```
+
+
+## 10.5. Ejecución del análisis del modelo final.
+
+En este apartado se ejecuta el análisis final del modelo seleccionado en función del tipo de algoritmo identificado previamente. Para ello, se utiliza una estructura condicional que permite aplicar la función de evaluación específica correspondiente a cada modelo (regresión logística, random forest o árbol de decisión). De este modo, se garantiza un tratamiento coherente del modelo final y se obtienen los resultados necesarios para su interpretación.
+
+```{r ejecucion_analisis_modelo_final, echo=TRUE, warning=FALSE, message=FALSE}
+resultado_modelo_final <- switch(
+  best_model_key,
+  logit = analisis_final_logistica(
+    fit_modelo_final = fit_modelo_final,
+    predicciones_todos_modelos = predicciones_todos_modelos,
+    best_model_label = best_model_label,
+    best_balance = best_balance,
+    stroke_mod = stroke_mod
+  ),
+  rf = analisis_final_rf(
+    fit_modelo_final = fit_modelo_final,
+    predicciones_todos_modelos = predicciones_todos_modelos,
+    best_model_label = best_model_label,
+    best_balance = best_balance,
+    stroke_mod = stroke_mod
+  ),
+  tree = analisis_final_arbol(
+    fit_modelo_final = fit_modelo_final,
+    predicciones_todos_modelos = predicciones_todos_modelos,
+    best_model_label = best_model_label,
+    best_balance = best_balance,
+    stroke_mod = stroke_mod
+  ),
+  stop("No se reconoce el modelo final seleccionado.")
+)
+```
